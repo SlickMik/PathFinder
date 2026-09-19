@@ -16,7 +16,8 @@
             "enableSceneSupport": true
           }
         }
-      ]
+      ],
+      ["expo-audio", { "microphonePermission": false }]
     ],
     "ios": {
       "supportsTablet": true,

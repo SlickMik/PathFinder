@@ -1,6 +1,7 @@
 import type { EventSubscription } from 'expo-modules-core';
 import NativeModule from './src/ExpoLidarVisionModule';
 import type {
+  CapturedFrame,
   LidarOptions,
   LidarSessionError,
   LidarSupport,
@@ -28,6 +29,11 @@ export const ExpoLidarVision = {
   async stop(): Promise<void> {
     if (!NativeModule) return;
     return NativeModule.stop();
+  },
+
+  async captureFrame(maxDimension = 768, quality = 0.6): Promise<CapturedFrame> {
+    if (!NativeModule) throw new Error('Camera is unavailable on this build.');
+    return NativeModule.captureFrame(maxDimension, quality);
   },
 
   onSnapshot(listener: (snapshot: ObstacleSnapshot) => void): EventSubscription {

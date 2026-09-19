@@ -1,4 +1,5 @@
 import ARKit
+import CoreImage
 import UIKit
 import simd
 
@@ -33,6 +34,8 @@ final class LidarSession: NSObject, ARSessionDelegate {
   private var lastCameraPosition: SIMD3<Float>?
   private var lastCameraForward: SIMD3<Float>?
   private var floorHeight: Float?
+  private var latestFrame: ARFrame?
+  private let ciContext = CIContext()
   private var backgroundObserver: NSObjectProtocol?
   private var thermalObserver: NSObjectProtocol?
 
@@ -106,10 +109,39 @@ final class LidarSession: NSObject, ARSessionDelegate {
       guard let self else { return }
       self.isRunning = false
       self.session.pause()
+      self.latestFrame = nil
       self.processor.reset()
       self.floorHeight = nil
       self.lastCameraPosition = nil
       self.lastCameraForward = nil
+    }
+  }
+
+  // Reads the newest ARKit camera frame on the processing queue and returns a
+  // downscaled JPEG. Nothing is retained after encoding.
+  func captureFrame(maxDimension: Double, quality: Double) throws -> Payload {
+    try processingQueue.sync {
+      guard isRunning, let frame = latestFrame else {
+        throw LidarSessionException("Camera is not running. Start scanning first.")
+      }
+      // capturedImage is landscape-right; rotate so the image is upright in portrait.
+      var image = CIImage(cvPixelBuffer: frame.capturedImage).oriented(.right)
+      let scale = min(1.0, maxDimension / Double(max(image.extent.width, image.extent.height)))
+      if scale < 1 { image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) }
+
+      guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+            let jpeg = ciContext.jpegRepresentation(
+              of: image,
+              colorSpace: colorSpace,
+              options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: quality]
+            ) else {
+        throw LidarSessionException("Unable to encode camera frame.")
+      }
+      return [
+        "base64": jpeg.base64EncodedString(),
+        "width": Int(image.extent.width),
+        "height": Int(image.extent.height)
+      ]
     }
   }
 
@@ -125,6 +157,7 @@ final class LidarSession: NSObject, ARSessionDelegate {
 
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
     guard isRunning else { return }
+    latestFrame = frame
     let minimumInterval = 1.0 / options.updateHz
     guard frame.timestamp - lastProcessedTimestamp >= minimumInterval else { return }
     let deltaTime = lastProcessedTimestamp == 0 ? minimumInterval : frame.timestamp - lastProcessedTimestamp

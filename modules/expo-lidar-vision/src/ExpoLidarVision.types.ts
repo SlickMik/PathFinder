@@ -1,6 +1,7 @@
 import type { NativeModule } from 'expo';
 import type { EventSubscription } from 'expo-modules-core';
 import type {
+  CapturedFrame,
   LidarOptions,
   LidarSessionError,
   LidarSupport,
@@ -17,6 +18,7 @@ export declare class ExpoLidarVisionNativeModule extends NativeModule<ExpoLidarV
   requestPermission(): Promise<boolean>;
   start(options: LidarOptions): Promise<void>;
   stop(): Promise<void>;
+  captureFrame(maxDimension: number, quality: number): Promise<CapturedFrame>;
   addListener<EventName extends keyof ExpoLidarVisionEvents>(
     eventName: EventName,
     listener: ExpoLidarVisionEvents[EventName],

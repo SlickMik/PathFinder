@@ -2,7 +2,7 @@ import { ScanControl } from '../components/ScanControl';
 import { SectorStatus } from '../components/SectorStatus';
 import { StatusAnnouncement } from '../components/StatusAnnouncement';
 import { useLidarScanner } from '../features/scanning/useLidarScanner';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 const RISK_COPY = {
@@ -93,6 +93,19 @@ export default function ScannerScreen() {
           onPress={() => (scanner.active ? void scanner.stop() : void scanner.start())}
           status={scanner.status}
         />
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Describe scene"
+          accessibilityHint="Sends one camera frame for a spoken description."
+          disabled={!scanner.active}
+          onPress={() => void scanner.describeScene()}
+          style={[styles.describe, !scanner.active && styles.describeDisabled]}
+        >
+          <Text maxFontSizeMultiplier={1.6} style={styles.describeText}>
+            Describe scene
+          </Text>
+        </Pressable>
 
         <View style={styles.safetyNote}>
           <Text maxFontSizeMultiplier={2} style={styles.safetyTitle}>
@@ -224,6 +237,22 @@ const styles = StyleSheet.create({
   sectors: {
     flexDirection: 'row',
     gap: 8,
+  },
+  describe: {
+    minHeight: 56,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#B8C147',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  describeDisabled: {
+    opacity: 0.4,
+  },
+  describeText: {
+    color: '#F2FF63',
+    fontSize: 18,
+    fontWeight: '800',
   },
   safetyNote: {
     borderTopWidth: 1,

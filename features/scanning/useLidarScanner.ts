@@ -2,8 +2,10 @@ import { DEFAULT_LIDAR_OPTIONS } from '../../config/thresholds';
 import { ExpoLidarVision } from '../../modules/expo-lidar-vision';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AccessibilityInfo, AppState } from 'react-native';
+import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
+import { describeCurrentScene } from '../speech/sceneDescriber';
+import { speak, stopSpeaking } from '../speech/speech';
 import { emitRiskHaptic, hapticIntervalMs } from './haptics';
 import type {
   AlertState,
@@ -49,7 +51,7 @@ export function useLidarScanner() {
     const last = lastAnnouncementRef.current;
     if (!critical && last.text === text && now - last.timestamp < 5000) return;
     lastAnnouncementRef.current = { text, timestamp: now };
-    AccessibilityInfo.announceForAccessibility(text);
+    void speak(text, critical);
   }, []);
 
   useEffect(() => {
@@ -97,7 +99,8 @@ export function useLidarScanner() {
     setAlert(INITIAL_ALERT_STATE);
     setStatus((current) => (current === 'unsupported' ? current : 'ready'));
     deactivateKeepAwake(KEEP_AWAKE_TAG);
-    if (announceStop) AccessibilityInfo.announceForAccessibility('Obstacle alerts stopped.');
+    void stopSpeaking();
+    if (announceStop) void speak('Obstacle alerts stopped.');
   }, []);
 
   useEffect(() => {
@@ -152,8 +155,19 @@ export function useLidarScanner() {
     }
   }, [announce, support]);
 
+  const describeScene = useCallback(async () => {
+    if (!active) return;
+    try {
+      announce('Describing scene.');
+      announce(await describeCurrentScene(), true);
+    } catch (error) {
+      announce(error instanceof Error ? error.message : 'Unable to describe the scene.');
+    }
+  }, [active, announce]);
+
   return {
     active,
+    describeScene,
     alert,
     errorMessage,
     snapshot,

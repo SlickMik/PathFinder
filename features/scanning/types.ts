@@ -61,3 +61,9 @@ export type AlertState = {
   unknownFrameCount: number;
   announcement: string | null;
 };
+
+export type CapturedFrame = {
+  base64: string;
+  width: number;
+  height: number;
+};
