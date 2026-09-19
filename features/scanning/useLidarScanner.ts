@@ -320,6 +320,7 @@ export function useLidarScanner() {
 
   const askCompanion = useCallback(
     async (text: string) => {
+      console.log(`[companion] user said: "${text}"`);
       try {
         // The user spoke — cut off any ongoing narration immediately.
         await stopSpeaking();
@@ -328,8 +329,10 @@ export function useLidarScanner() {
           snapshot: snapshotRef.current,
           withFrame: wantsToSee && active,
         });
+        console.log(`[companion] reply: "${reply}"`);
         announce(reply, true);
-      } catch {
+      } catch (error) {
+        console.warn('[companion] request failed:', error);
         announce('Companion is unavailable right now.');
       }
     },

@@ -41,6 +41,7 @@ async function requestReply(
   { snapshot = null, withFrame = false }: CompanionOptions,
 ): Promise<string> {
   if (!COMPANION_URL) throw new Error('Companion backend is not configured.');
+  console.log(`[companion] POST ${COMPANION_URL} (frame=${withFrame})`);
 
   const frame = withFrame ? await ExpoLidarVision.captureFrame(768, 0.6) : null;
   const controller = new AbortController();
