@@ -89,6 +89,25 @@ describe('reactive LiDAR navigation', () => {
     expect(result.phrase).toContain('keep centered');
   });
 
+  it('preserves a segmented path as the native guidance source', () => {
+    const value = snapshot(2, 2, 2);
+    value.route = {
+      instruction: 'slight-left',
+      status: 'clear',
+      minimumClearanceM: 0.8,
+      openingWidthM: 1.6,
+      headingDeltaDeg: -10,
+      confidence: 0.9,
+      isNarrowOpening: false,
+      source: 'segmented-path',
+      surfaceClass: 'sidewalk',
+    };
+
+    const result = planNavigation(value, envelope);
+    expect(result.instruction).toBe('slight-left');
+    expect(result.source).toBe('segmented-path');
+  });
+
   it('falls back to sectors while the local route map is still uncertain', () => {
     const value = snapshot(4, 0.8, 1.3);
     value.route = {

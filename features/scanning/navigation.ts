@@ -75,7 +75,7 @@ export function planNavigation(
         : planned.phrase,
       openingWidthM: route.openingWidthM,
       isNarrowOpening: route.isNarrowOpening,
-      source: 'lidar-route',
+      source: route.source ?? 'lidar-route',
     };
   }
 

@@ -15,8 +15,8 @@ import {
 } from './navigation';
 import type {
   AlertState,
-  CameraTestFrame,
   LidarSupport,
+  LiveDebugFrame,
   NavigationGuidance,
   ObstacleSnapshot,
   ScannerStatus,
@@ -39,9 +39,8 @@ export function useLidarScanner() {
   );
   const [safetyEnvelope, setSafetyEnvelope] = useState(INITIAL_SAFETY_ENVELOPE);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [cameraTestFrame, setCameraTestFrame] = useState<CameraTestFrame | null>(null);
-  const [cameraTestBusy, setCameraTestBusy] = useState(false);
-  const [cameraTestError, setCameraTestError] = useState<string | null>(null);
+  const [liveDebugFrame, setLiveDebugFrame] = useState<LiveDebugFrame | null>(null);
+  const [liveDebugError, setLiveDebugError] = useState<string | null>(null);
   const alertRef = useRef(INITIAL_ALERT_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
@@ -168,9 +167,8 @@ export function useLidarScanner() {
     setGuidance(INITIAL_NAVIGATION_GUIDANCE);
     setSafetyEnvelope(INITIAL_SAFETY_ENVELOPE);
     lastGuidanceSpeechRef.current = { instruction: 'hold', timestamp: 0 };
-    setCameraTestFrame(null);
-    setCameraTestBusy(false);
-    setCameraTestError(null);
+    setLiveDebugFrame(null);
+    setLiveDebugError(null);
     setStatus((current) => (current === 'unsupported' ? current : 'ready'));
     deactivateKeepAwake(KEEP_AWAKE_TAG);
     void stopSpeaking();
@@ -193,6 +191,44 @@ export function useLidarScanner() {
     const timer = setInterval(() => void emitRiskHaptic(alertRef.current.risk), intervalMs);
     return () => clearInterval(timer);
   }, [active, alert.risk]);
+
+  useEffect(() => {
+    if (!active) {
+      setLiveDebugFrame(null);
+      setLiveDebugError(null);
+      return;
+    }
+
+    let cancelled = false;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const refresh = async () => {
+      try {
+        const frame = await ExpoLidarVision.captureDebugFrame(640, 0.45);
+        if (cancelled) return;
+        const { base64, ...metadata } = frame;
+        setLiveDebugFrame({
+          ...metadata,
+          uri: `data:image/jpeg;base64,${base64}`,
+          capturedAtMs: Date.now(),
+        });
+        setLiveDebugError(null);
+      } catch (error) {
+        if (cancelled) return;
+        setLiveDebugError(
+          error instanceof Error ? error.message : 'Live camera preview is unavailable.',
+        );
+      } finally {
+        if (!cancelled) refreshTimer = setTimeout(() => void refresh(), 350);
+      }
+    };
+
+    void refresh();
+    return () => {
+      cancelled = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
+    };
+  }, [active]);
 
   useEffect(
     () => () => {
@@ -240,42 +276,19 @@ export function useLidarScanner() {
     }
   }, [active, announce]);
 
-  const testCamera = useCallback(async () => {
-    if (!active || cameraTestBusy) return;
-    setCameraTestBusy(true);
-    setCameraTestError(null);
-    try {
-      const frame = await ExpoLidarVision.captureFrame(640, 0.55);
-      setCameraTestFrame({
-        ...frame,
-        uri: `data:image/jpeg;base64,${frame.base64}`,
-        capturedAtMs: Date.now(),
-      });
-      announce('Camera test passed. Preview updated.');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to capture a camera frame.';
-      setCameraTestError(message);
-      announce(message);
-    } finally {
-      setCameraTestBusy(false);
-    }
-  }, [active, announce, cameraTestBusy]);
-
   return {
     active,
-    cameraTestBusy,
-    cameraTestError,
-    cameraTestFrame,
     describeScene,
     alert,
     errorMessage,
     guidance,
+    liveDebugError,
+    liveDebugFrame,
     safetyEnvelope,
     snapshot,
     start,
     status,
     stop,
     support,
-    testCamera,
   };
 }

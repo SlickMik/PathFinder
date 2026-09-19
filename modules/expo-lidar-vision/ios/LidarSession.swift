@@ -130,25 +130,113 @@ final class LidarSession: NSObject, ARSessionDelegate {
       guard isRunning, let frame = latestFrame else {
         throw LidarSessionException("Camera is not running. Start scanning first.")
       }
-      // capturedImage is landscape-right; rotate so the image is upright in portrait.
-      var image = CIImage(cvPixelBuffer: frame.capturedImage).oriented(.right)
-      let scale = min(1.0, maxDimension / Double(max(image.extent.width, image.extent.height)))
-      if scale < 1 { image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) }
-
-      guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-            let jpeg = ciContext.jpegRepresentation(
-              of: image,
-              colorSpace: colorSpace,
-              options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: quality]
-            ) else {
-        throw LidarSessionException("Unable to encode camera frame.")
-      }
-      return [
-        "base64": jpeg.base64EncodedString(),
-        "width": Int(image.extent.width),
-        "height": Int(image.extent.height)
-      ]
+      return try encodeFrame(
+        frame,
+        maxDimension: maxDimension,
+        quality: quality,
+        personMask: nil,
+        includeDebugMetadata: false
+      )
     }
+  }
+
+  /// Returns a lightweight preview frame with the same person mask used by the
+  /// obstacle pipeline composited in magenta. This is intentionally separate
+  /// from captureFrame so scene-description uploads always receive a clean image.
+  func captureDebugFrame(maxDimension: Double, quality: Double) throws -> Payload {
+    try processingQueue.sync {
+      guard isRunning, let frame = latestFrame else {
+        throw LidarSessionException("Camera is not running. Start scanning first.")
+      }
+      return try encodeFrame(
+        frame,
+        maxDimension: maxDimension,
+        quality: quality,
+        personMask: processor.currentPersonMask(),
+        includeDebugMetadata: true
+      )
+    }
+  }
+
+  private func encodeFrame(
+    _ frame: ARFrame,
+    maxDimension: Double,
+    quality: Double,
+    personMask: PersonMask?,
+    includeDebugMetadata: Bool
+  ) throws -> Payload {
+    // capturedImage is landscape-right; rotate so the image is upright in portrait.
+    var image = normalizedOrigin(CIImage(cvPixelBuffer: frame.capturedImage).oriented(.right))
+    if let personMask {
+      image = applyingPersonOverlay(to: image, mask: personMask)
+    }
+
+    let scale = min(1.0, maxDimension / Double(max(image.extent.width, image.extent.height)))
+    if scale < 1 {
+      image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    }
+
+    guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+          let jpeg = ciContext.jpegRepresentation(
+            of: image,
+            colorSpace: colorSpace,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: quality]
+          ) else {
+      throw LidarSessionException("Unable to encode camera frame.")
+    }
+
+    var payload: Payload = [
+      "base64": jpeg.base64EncodedString(),
+      "width": Int(image.extent.width),
+      "height": Int(image.extent.height)
+    ]
+    if includeDebugMetadata {
+      payload["segmentationAvailable"] = personMask != nil
+      payload["personDetected"] = personMask?.containsPerson ?? false
+    }
+    return payload
+  }
+
+  private func applyingPersonOverlay(to cameraImage: CIImage, mask: PersonMask) -> CIImage {
+    let maskData = Data(mask.pixels)
+    var maskImage = CIImage(
+      bitmapData: maskData,
+      bytesPerRow: mask.width,
+      size: CGSize(width: mask.width, height: mask.height),
+      format: .L8,
+      colorSpace: CGColorSpaceCreateDeviceGray()
+    )
+    maskImage = normalizedOrigin(maskImage.oriented(.right))
+
+    let scaleX = cameraImage.extent.width / max(maskImage.extent.width, 1)
+    let scaleY = cameraImage.extent.height / max(maskImage.extent.height, 1)
+    maskImage = maskImage
+      .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+      .cropped(to: cameraImage.extent)
+
+    let personColor = CIImage(
+      color: CIColor(red: 1, green: 0.08, blue: 0.48, alpha: 0.62)
+    ).cropped(to: cameraImage.extent)
+    let transparent = CIImage(
+      color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)
+    ).cropped(to: cameraImage.extent)
+    let overlay = personColor.applyingFilter(
+      "CIBlendWithMask",
+      parameters: [
+        kCIInputBackgroundImageKey: transparent,
+        kCIInputMaskImageKey: maskImage
+      ]
+    )
+    return overlay.composited(over: cameraImage)
+  }
+
+  private func normalizedOrigin(_ image: CIImage) -> CIImage {
+    image.transformed(
+      by: CGAffineTransform(
+        translationX: -image.extent.origin.x,
+        y: -image.extent.origin.y
+      )
+    )
   }
 
   private func stopForSystemReason(code: String, message: String) {

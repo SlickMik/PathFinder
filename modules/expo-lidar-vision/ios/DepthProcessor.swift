@@ -26,6 +26,7 @@ final class DepthProcessor {
   private var corridorHistory: [DistanceSample] = []
   private let routePlanner = LocalRoutePlanner()
   private let personSegmenter = PersonSegmenter()
+  private let walkableSurfaceSegmenter = WalkableSurfaceSegmenter()
   private let voxelSize: Float = 0.1
   private let mapLifetime: TimeInterval = 0.45
   private let sampleStride = 3
@@ -35,6 +36,11 @@ final class DepthProcessor {
     corridorHistory.removeAll(keepingCapacity: true)
     routePlanner.reset()
     personSegmenter.reset()
+    walkableSurfaceSegmenter.reset()
+  }
+
+  func currentPersonMask() -> PersonMask? {
+    personSegmenter.currentMask()
   }
 
   func unknownSnapshot(tracking: String, aim: String, speedMps: Float = 0) -> Payload {
@@ -80,6 +86,7 @@ final class DepthProcessor {
       return unknownSnapshot(tracking: tracking, aim: aim, speedMps: speedMps)
     }
     let personMask = personSegmenter.mask(for: frame)
+    let surfaceMask = walkableSurfaceSegmenter.mask(for: frame)
 
     CVPixelBufferLockBaseAddress(depthMap, .readOnly)
     CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
@@ -121,6 +128,20 @@ final class DepthProcessor {
     let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
     let confidenceRowBytes = CVPixelBufferGetBytesPerRow(confidenceMap)
     let now = frame.timestamp
+    if let surfaceMask {
+      observeWalkableSurface(
+        mask: surfaceMask,
+        cameraTransform: transform,
+        cameraPosition: cameraPosition,
+        forward: forward,
+        right: right,
+        floorHeight: floorHeight ?? cameraPosition.y - 1.45,
+        intrinsics: intrinsics,
+        imageWidth: Float(imageResolution.width),
+        imageHeight: Float(imageResolution.height),
+        timestamp: now
+      )
+    }
     var examined = 0
     var sectorReliableCounts = [0, 0, 0]
     var sectorConfidenceValues = [[Int](), [Int](), [Int]()]
@@ -281,6 +302,53 @@ final class DepthProcessor {
       ],
       "route": route
     ]
+  }
+
+  /// Reprojects the camera segmentation onto a world-locked ground grid. ARKit
+  /// visual-inertial odometry supplies the camera transform; LiDAR remains the
+  /// independent source of clearance and collision evidence.
+  private func observeWalkableSurface(
+    mask: WalkableSurfaceMask,
+    cameraTransform: simd_float4x4,
+    cameraPosition: SIMD3<Float>,
+    forward: SIMD3<Float>,
+    right: SIMD3<Float>,
+    floorHeight: Float,
+    intrinsics: simd_float3x3,
+    imageWidth: Float,
+    imageHeight: Float,
+    timestamp: TimeInterval
+  ) {
+    guard routePlanner.beginSurfaceObservation(maskTimestamp: mask.timestamp) else { return }
+    let worldToCamera = simd_inverse(cameraTransform)
+    let fx = intrinsics.columns.0.x
+    let fy = intrinsics.columns.1.y
+    let cx = intrinsics.columns.2.x
+    let cy = intrinsics.columns.2.y
+
+    for longitudinal in stride(from: 0.35 as Float, through: 3.2, by: 0.10) {
+      for lateral in stride(from: -1.8 as Float, through: 1.8, by: 0.10) {
+        var worldPoint = cameraPosition + forward * longitudinal + right * lateral
+        worldPoint.y = floorHeight
+        let cameraPoint = worldToCamera * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1)
+        let depth = -cameraPoint.z
+        guard depth > 0.1 else { continue }
+        let imageX = cameraPoint.x * fx / depth + cx
+        let imageY = cy - cameraPoint.y * fy / depth
+        guard let surfaceClass = mask.surfaceClass(
+          imageX: imageX,
+          imageY: imageY,
+          imageWidth: imageWidth,
+          imageHeight: imageHeight
+        ), let traversability = surfaceClass.traversability else { continue }
+        routePlanner.observeSurface(
+          at: worldPoint,
+          traversability: traversability,
+          className: surfaceClass.name,
+          timestamp: timestamp
+        )
+      }
+    }
   }
 
   private func sectorIndex(lateral: Float, forward: Float) -> Int? {

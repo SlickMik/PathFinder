@@ -41,10 +41,10 @@ export function ScanControl({ active, disabled, status, onPress }: Props) {
 
 const styles = StyleSheet.create({
   button: {
-    minHeight: 118,
-    borderRadius: 24,
-    paddingHorizontal: 24,
-    paddingVertical: 24,
+    minHeight: 68,
+    borderRadius: 18,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -66,8 +66,8 @@ const styles = StyleSheet.create({
     transform: [{ scale: 0.985 }],
   },
   icon: {
-    width: 24,
-    height: 24,
+    width: 20,
+    height: 20,
   },
   startIcon: {
     borderRadius: 12,
@@ -81,8 +81,8 @@ const styles = StyleSheet.create({
   },
   label: {
     color: '#0B0D10',
-    fontSize: 23,
-    lineHeight: 29,
+    fontSize: 19,
+    lineHeight: 24,
     fontWeight: '800',
     textAlign: 'center',
   },

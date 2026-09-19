@@ -7,6 +7,10 @@ struct PersonMask {
   let width: Int
   let height: Int
 
+  var containsPerson: Bool {
+    pixels.contains { $0 >= 96 }
+  }
+
   func contains(depthX: Int, depthY: Int, depthWidth: Int, depthHeight: Int) -> Bool {
     guard depthWidth > 0, depthHeight > 0, width > 0, height > 0 else { return false }
     let x = min(width - 1, max(0, depthX * width / depthWidth))
@@ -26,6 +30,10 @@ final class PersonSegmenter {
   func reset() {
     lastMask = nil
     lastRun = -.infinity
+  }
+
+  func currentMask() -> PersonMask? {
+    lastMask
   }
 
   func mask(for frame: ARFrame) -> PersonMask? {

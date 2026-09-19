@@ -1,4 +1,5 @@
 import { ScanControl } from '../components/ScanControl';
+import { RouteDebugOverlay } from '../components/RouteDebugOverlay';
 import { SectorStatus } from '../components/SectorStatus';
 import { StatusAnnouncement } from '../components/StatusAnnouncement';
 import { useLidarScanner } from '../features/scanning/useLidarScanner';
@@ -40,12 +41,23 @@ export default function ScannerScreen() {
   const snapshot = scanner.snapshot;
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <ScrollView
-        alwaysBounceVertical={false}
-        contentContainerStyle={styles.content}
-        showsVerticalScrollIndicator={false}
-      >
+    <View style={styles.screen}>
+      {scanner.liveDebugFrame ? (
+        <Image
+          accessibilityIgnoresInvertColors
+          blurRadius={2}
+          resizeMode="cover"
+          source={{ uri: scanner.liveDebugFrame.uri }}
+          style={styles.cameraBackground}
+        />
+      ) : null}
+      <View pointerEvents="none" style={styles.backgroundScrim} />
+      <SafeAreaView style={styles.safeArea}>
+        <ScrollView
+          alwaysBounceVertical={false}
+          contentContainerStyle={styles.content}
+          showsVerticalScrollIndicator={false}
+        >
         <View style={styles.header}>
           <View style={styles.mark} accessibilityElementsHidden>
             <View style={styles.markLineShort} />
@@ -57,77 +69,34 @@ export default function ScannerScreen() {
               PATHFINDER
             </Text>
             <Text maxFontSizeMultiplier={1.5} style={styles.title}>
-              Obstacle alerts
+              Live navigation
             </Text>
+          </View>
+          <View style={styles.headerBadge}>
+            <View style={[styles.headerBadgeDot, scanner.active && styles.headerBadgeDotActive]} />
+            <Text style={styles.headerBadgeText}>{scanner.active ? 'LIVE' : 'READY'}</Text>
           </View>
         </View>
 
-        <View style={styles.cameraPanel}>
-          <View style={styles.cameraHeader}>
-            <View>
-              <Text maxFontSizeMultiplier={1.5} style={styles.cameraEyebrow}>
-                CAMERA TEST
-              </Text>
-              <Text
-                accessibilityLiveRegion="polite"
-                maxFontSizeMultiplier={1.5}
-                style={styles.cameraStatus}
-              >
-                {scanner.cameraTestBusy
-                  ? 'CAPTURING…'
-                  : scanner.cameraTestFrame
-                    ? 'CAMERA READY'
-                    : scanner.active
-                      ? 'READY TO TEST'
-                      : 'START SCANNING FIRST'}
-              </Text>
-            </View>
-            <View
-              style={[
-                styles.cameraIndicator,
-                scanner.cameraTestFrame && styles.cameraIndicatorReady,
-              ]}
-            />
-          </View>
+        <ScanControl
+          active={scanner.active}
+          disabled={unsupported || busy}
+          onPress={() => (scanner.active ? void scanner.stop() : void scanner.start())}
+          status={scanner.status}
+        />
 
-          {scanner.cameraTestFrame ? (
-            <Image
-              accessibilityIgnoresInvertColors
-              resizeMode="cover"
-              source={{ uri: scanner.cameraTestFrame.uri }}
-              style={styles.cameraPreview}
-            />
-          ) : (
-            <View style={styles.cameraPlaceholder}>
-              <Text maxFontSizeMultiplier={1.5} style={styles.cameraPlaceholderText}>
-                Camera preview appears here
-              </Text>
-            </View>
-          )}
+        <RouteDebugOverlay
+          active={scanner.active}
+          frame={scanner.liveDebugFrame}
+          guidance={scanner.guidance}
+          route={snapshot?.route}
+        />
 
-          {scanner.cameraTestError ? (
-            <Text accessibilityRole="alert" style={styles.cameraError}>
-              {scanner.cameraTestError}
-            </Text>
-          ) : null}
-
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Test camera"
-            accessibilityHint="Captures and displays the current ARKit camera frame."
-            disabled={!scanner.active || scanner.cameraTestBusy}
-            onPress={() => void scanner.testCamera()}
-            style={({ pressed }) => [
-              styles.cameraButton,
-              (!scanner.active || scanner.cameraTestBusy) && styles.cameraButtonDisabled,
-              pressed && scanner.active && styles.cameraButtonPressed,
-            ]}
-          >
-            <Text style={styles.cameraButtonText}>
-              {scanner.cameraTestBusy ? 'Capturing…' : 'Capture test frame'}
-            </Text>
-          </Pressable>
-        </View>
+        {scanner.liveDebugError ? (
+          <Text accessibilityRole="alert" style={styles.previewError}>
+            Live preview: {scanner.liveDebugError}
+          </Text>
+        ) : null}
 
         <StatusAnnouncement
           deviceAim={snapshot?.deviceAim}
@@ -203,13 +172,6 @@ export default function ScannerScreen() {
           <SectorStatus active={scanner.active} reading={snapshot?.right ?? null} sector="right" />
         </View>
 
-        <ScanControl
-          active={scanner.active}
-          disabled={unsupported || busy}
-          onPress={() => (scanner.active ? void scanner.stop() : void scanner.start())}
-          status={scanner.status}
-        />
-
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Describe scene"
@@ -232,15 +194,28 @@ export default function ScannerScreen() {
             that a route, stair, drop-off, glass surface, or crossing is safe.
           </Text>
         </View>
-      </ScrollView>
-    </SafeAreaView>
+        </ScrollView>
+      </SafeAreaView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+    backgroundColor: '#07090C',
+  },
+  cameraBackground: {
+    ...StyleSheet.absoluteFill,
+    opacity: 0.46,
+  },
+  backgroundScrim: {
+    ...StyleSheet.absoluteFill,
+    backgroundColor: 'rgba(5, 8, 11, 0.64)',
+  },
   safeArea: {
     flex: 1,
-    backgroundColor: '#0B0D10',
+    backgroundColor: 'transparent',
   },
   content: {
     paddingHorizontal: 20,
@@ -252,7 +227,11 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 14,
-    marginBottom: 2,
+    padding: 12,
+    borderRadius: 18,
+    backgroundColor: 'rgba(9, 12, 16, 0.76)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
   },
   mark: {
     width: 48,
@@ -279,83 +258,38 @@ const styles = StyleSheet.create({
   headerCopy: {
     flex: 1,
   },
-  cameraPanel: {
-    borderRadius: 20,
-    backgroundColor: '#171B21',
-    borderWidth: 1,
-    borderColor: '#303742',
-    padding: 14,
-    gap: 12,
-  },
-  cameraHeader: {
+  headerBadge: {
+    minHeight: 30,
+    borderRadius: 15,
+    paddingHorizontal: 10,
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
   },
-  cameraEyebrow: {
-    color: '#8E97A3',
-    fontSize: 10,
-    lineHeight: 14,
-    fontWeight: '900',
-    letterSpacing: 1.5,
+  headerBadgeDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#747E8A',
   },
-  cameraStatus: {
+  headerBadgeDotActive: {
+    backgroundColor: '#74F2A3',
+  },
+  headerBadgeText: {
     color: '#FFFFFF',
-    fontSize: 16,
-    lineHeight: 22,
-    fontWeight: '800',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 0.8,
   },
-  cameraIndicator: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: '#657080',
-  },
-  cameraIndicatorReady: {
-    backgroundColor: '#F2FF63',
-  },
-  cameraPreview: {
-    width: '100%',
-    aspectRatio: 4 / 3,
-    borderRadius: 14,
-    backgroundColor: '#090A0C',
-  },
-  cameraPlaceholder: {
-    width: '100%',
-    aspectRatio: 4 / 3,
-    borderRadius: 14,
-    backgroundColor: '#090A0C',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  cameraPlaceholderText: {
-    color: '#727B87',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  cameraError: {
-    color: '#FF8D88',
+  previewError: {
+    color: '#FFAAA6',
+    backgroundColor: 'rgba(75, 20, 24, 0.82)',
+    borderRadius: 12,
+    padding: 12,
     fontSize: 13,
     lineHeight: 18,
     fontWeight: '700',
-  },
-  cameraButton: {
-    minHeight: 48,
-    borderRadius: 14,
-    backgroundColor: '#F2FF63',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  cameraButtonDisabled: {
-    opacity: 0.4,
-  },
-  cameraButtonPressed: {
-    opacity: 0.8,
-  },
-  cameraButtonText: {
-    color: '#0B0D10',
-    fontSize: 16,
-    fontWeight: '900',
   },
   eyebrow: {
     color: '#F2FF63',
@@ -374,7 +308,7 @@ const styles = StyleSheet.create({
   riskPanel: {
     minHeight: 150,
     borderRadius: 20,
-    backgroundColor: '#171B21',
+    backgroundColor: 'rgba(18, 23, 29, 0.86)',
     borderWidth: 1,
     borderColor: '#303742',
     justifyContent: 'center',
@@ -479,6 +413,7 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     borderWidth: 1,
     borderColor: '#B8C147',
+    backgroundColor: 'rgba(8, 11, 14, 0.72)',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -494,6 +429,7 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: '#2B3038',
     paddingTop: 17,
+    paddingHorizontal: 4,
     gap: 5,
   },
   safetyTitle: {

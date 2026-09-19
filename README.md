@@ -18,6 +18,8 @@ short-range indoor guidance.
 - A three-second, world-locked free-space map with conservative unknown-space handling
 - Clearance-aware A* routing that inflates obstacles by body width plus a side margin
 - Narrow-opening guidance that only accepts an observed gap wide enough for that envelope
+- Optional Core ML walkable-surface segmentation projected into the world map with ARKit odometry
+- Live camera debugging with magenta person segmentation, route overlay, and a world-space trace
 - Apple's on-device person segmentation fused with LiDAR distance; person evidence expires quickly
 - On-device spoken steering through the iOS speech synthesizer
 - VoiceOver-friendly controls, large Dynamic Type, and an explicit safety boundary
@@ -43,6 +45,16 @@ npx expo run:ios --device
 Or open `ios/PathFinder.xcworkspace` in Xcode, select the PathFinder scheme and your connected
 iPhone, set your Apple Development team under Signing & Capabilities, and press Run. Open the
 workspace—not the `.xcodeproj`—so CocoaPods and the native LiDAR module are included.
+
+Start scanning to open the live spatial view. The camera refreshes automatically, people found by
+the on-device Vision model are highlighted in magenta, and the planner route is drawn over the
+scene. The lower trace shows the same route from above in phone-relative metres. The camera route
+projection is intentionally approximate for debugging. Rebuild the iOS development client after
+changing native camera, segmentation, or route code.
+
+The segmentation-to-guidance pipeline is implemented with a bundled Cityscapes/CamVid Core ML
+baseline (road and sidewalk classes). See [walkable-path segmentation](docs/walkable-path-segmentation.md)
+for the model contract, training recommendation, class mapping, and safety gates.
 
 For a shared device build, configure Apple signing and run `eas build --profile development
 --platform ios`.

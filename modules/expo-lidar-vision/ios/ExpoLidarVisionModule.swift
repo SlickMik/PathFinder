@@ -82,6 +82,13 @@ public final class ExpoLidarVisionModule: Module {
       )
     }
 
+    AsyncFunction("captureDebugFrame") { (maxDimension: Double, quality: Double) -> [String: Any] in
+      try self.lidarSession.captureDebugFrame(
+        maxDimension: min(max(maxDimension, 320), 960),
+        quality: min(max(quality, 0.3), 0.75)
+      )
+    }
+
     OnDestroy {
       self.lidarSession.stop()
     }

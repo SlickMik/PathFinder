@@ -47,7 +47,22 @@ export type ObstacleSnapshot = {
     headingDeltaDeg: number;
     confidence: number;
     isNarrowOpening: boolean;
+    /** Whether the native path was constrained by semantic walkable-surface evidence. */
+    source?: 'segmented-path' | 'lidar-route';
+    surfaceClass?:
+      | 'terrain'
+      | 'curb-cut'
+      | 'sidewalk'
+      | 'plain-crosswalk'
+      | 'zebra-crosswalk'
+      | 'covering'
+      | null;
     goalDistanceM?: number;
+    /** Shortest observed path in metres, relative to the phone. */
+    path?: Array<{
+      lateralM: number;
+      forwardM: number;
+    }>;
   };
 };
 
@@ -67,7 +82,7 @@ export type NavigationGuidance = {
   clearanceM: number | null;
   openingWidthM: number | null;
   isNarrowOpening: boolean;
-  source: 'lidar-route' | 'reactive-sectors' | 'none';
+  source: 'segmented-path' | 'lidar-route' | 'reactive-sectors' | 'none';
   pendingInstruction: NavigationInstruction | null;
   pendingFrameCount: number;
 };
@@ -110,7 +125,12 @@ export type CapturedFrame = {
   height: number;
 };
 
-export type CameraTestFrame = CapturedFrame & {
+export type DebugFramePayload = CapturedFrame & {
+  segmentationAvailable: boolean;
+  personDetected: boolean;
+};
+
+export type LiveDebugFrame = Omit<DebugFramePayload, 'base64'> & {
   uri: string;
   capturedAtMs: number;
 };

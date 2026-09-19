@@ -10,7 +10,7 @@ Pod::Spec.new do |s|
   s.static_framework = true
 
   s.dependency 'ExpoModulesCore'
-  s.frameworks = 'ARKit', 'AVFoundation', 'Accelerate'
+  s.frameworks = 'ARKit', 'AVFoundation', 'Accelerate', 'CoreML', 'Vision'
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
@@ -18,4 +18,5 @@ Pod::Spec.new do |s|
   }
 
   s.source_files = '**/*.{h,m,mm,swift,hpp,cpp}'
+  s.resources = '**/*.mlmodel'
 end
