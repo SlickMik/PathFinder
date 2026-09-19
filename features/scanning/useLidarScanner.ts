@@ -7,14 +7,26 @@ import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
 import { describeCurrentScene } from '../speech/sceneDescriber';
 import { speak, stopSpeaking } from '../speech/speech';
 import { emitRiskHaptic, hapticIntervalMs } from './haptics';
+import { safetyEnvelopeForSpeed } from './motionSafety';
+import {
+  INITIAL_NAVIGATION_GUIDANCE,
+  planNavigation,
+  reduceNavigationGuidance,
+} from './navigation';
 import type {
   AlertState,
+  CameraTestFrame,
   LidarSupport,
+  NavigationGuidance,
   ObstacleSnapshot,
   ScannerStatus,
 } from './types';
 
 const KEEP_AWAKE_TAG = 'pathfinder-lidar-session';
+const INITIAL_SAFETY_ENVELOPE = safetyEnvelopeForSpeed(
+  0,
+  DEFAULT_LIDAR_OPTIONS.reactionTimeS,
+);
 
 export function useLidarScanner() {
   const [support, setSupport] = useState<LidarSupport | null>(null);
@@ -22,9 +34,18 @@ export function useLidarScanner() {
   const [active, setActive] = useState(false);
   const [snapshot, setSnapshot] = useState<ObstacleSnapshot | null>(null);
   const [alert, setAlert] = useState<AlertState>(INITIAL_ALERT_STATE);
+  const [guidance, setGuidance] = useState<NavigationGuidance>(
+    INITIAL_NAVIGATION_GUIDANCE,
+  );
+  const [safetyEnvelope, setSafetyEnvelope] = useState(INITIAL_SAFETY_ENVELOPE);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [cameraTestFrame, setCameraTestFrame] = useState<CameraTestFrame | null>(null);
+  const [cameraTestBusy, setCameraTestBusy] = useState(false);
+  const [cameraTestError, setCameraTestError] = useState<string | null>(null);
   const alertRef = useRef(INITIAL_ALERT_STATE);
+  const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
+  const lastGuidanceSpeechRef = useRef({ instruction: 'hold', timestamp: 0 });
 
   useEffect(() => {
     let cancelled = false;
@@ -54,13 +75,56 @@ export function useLidarScanner() {
     void speak(text, critical);
   }, []);
 
+  const speakGuidance = useCallback(
+    (nextGuidance: NavigationGuidance, previousGuidance: NavigationGuidance) => {
+      if (!nextGuidance.phrase || nextGuidance.instruction === 'hold') return;
+
+      const now = Date.now();
+      const last = lastGuidanceSpeechRef.current;
+      const changed = nextGuidance.instruction !== previousGuidance.instruction;
+      const repeatAfterMs = nextGuidance.instruction === 'stop' ? 1600 : 5000;
+      if (!changed && now - last.timestamp < repeatAfterMs) return;
+      if (last.instruction === nextGuidance.instruction && now - last.timestamp < repeatAfterMs) {
+        return;
+      }
+
+      lastGuidanceSpeechRef.current = {
+        instruction: nextGuidance.instruction,
+        timestamp: now,
+      };
+      void stopSpeaking().finally(() =>
+        speak(nextGuidance.phrase!, nextGuidance.instruction === 'stop'),
+      );
+    },
+    [],
+  );
+
   useEffect(() => {
     const snapshotSubscription = ExpoLidarVision.onSnapshot((nextSnapshot) => {
       setSnapshot(nextSnapshot);
 
-      const nextAlert = reduceAlertState(alertRef.current, nextSnapshot);
+      const nextSafetyEnvelope = safetyEnvelopeForSpeed(
+        nextSnapshot.motion.speedMps,
+        DEFAULT_LIDAR_OPTIONS.reactionTimeS,
+      );
+      setSafetyEnvelope(nextSafetyEnvelope);
+
+      const nextAlert = reduceAlertState(
+        alertRef.current,
+        nextSnapshot,
+        nextSafetyEnvelope,
+      );
       alertRef.current = nextAlert;
       setAlert(nextAlert);
+
+      const previousGuidance = guidanceRef.current;
+      const nextGuidance = reduceNavigationGuidance(
+        previousGuidance,
+        planNavigation(nextSnapshot, nextSafetyEnvelope),
+      );
+      guidanceRef.current = nextGuidance;
+      setGuidance(nextGuidance);
+      speakGuidance(nextGuidance, previousGuidance);
 
       const viewValid =
         nextSnapshot.tracking === 'normal' && nextSnapshot.deviceAim === 'forward';
@@ -75,6 +139,9 @@ export function useLidarScanner() {
     const errorSubscription = ExpoLidarVision.onError((error) => {
       alertRef.current = INITIAL_ALERT_STATE;
       setAlert(INITIAL_ALERT_STATE);
+      guidanceRef.current = INITIAL_NAVIGATION_GUIDANCE;
+      setGuidance(INITIAL_NAVIGATION_GUIDANCE);
+      setSafetyEnvelope(INITIAL_SAFETY_ENVELOPE);
       setErrorMessage(error.message);
       setStatus(error.recoverable ? 'paused' : 'error');
       if (!error.recoverable) {
@@ -89,7 +156,7 @@ export function useLidarScanner() {
       snapshotSubscription.remove();
       errorSubscription.remove();
     };
-  }, [announce]);
+  }, [announce, speakGuidance]);
 
   const stop = useCallback(async (announceStop = true) => {
     await ExpoLidarVision.stop();
@@ -97,6 +164,13 @@ export function useLidarScanner() {
     setSnapshot(null);
     alertRef.current = INITIAL_ALERT_STATE;
     setAlert(INITIAL_ALERT_STATE);
+    guidanceRef.current = INITIAL_NAVIGATION_GUIDANCE;
+    setGuidance(INITIAL_NAVIGATION_GUIDANCE);
+    setSafetyEnvelope(INITIAL_SAFETY_ENVELOPE);
+    lastGuidanceSpeechRef.current = { instruction: 'hold', timestamp: 0 };
+    setCameraTestFrame(null);
+    setCameraTestBusy(false);
+    setCameraTestError(null);
     setStatus((current) => (current === 'unsupported' ? current : 'ready'));
     deactivateKeepAwake(KEEP_AWAKE_TAG);
     void stopSpeaking();
@@ -123,6 +197,7 @@ export function useLidarScanner() {
   useEffect(
     () => () => {
       void ExpoLidarVision.stop();
+      void stopSpeaking();
       deactivateKeepAwake(KEEP_AWAKE_TAG);
     },
     [],
@@ -165,15 +240,42 @@ export function useLidarScanner() {
     }
   }, [active, announce]);
 
+  const testCamera = useCallback(async () => {
+    if (!active || cameraTestBusy) return;
+    setCameraTestBusy(true);
+    setCameraTestError(null);
+    try {
+      const frame = await ExpoLidarVision.captureFrame(640, 0.55);
+      setCameraTestFrame({
+        ...frame,
+        uri: `data:image/jpeg;base64,${frame.base64}`,
+        capturedAtMs: Date.now(),
+      });
+      announce('Camera test passed. Preview updated.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to capture a camera frame.';
+      setCameraTestError(message);
+      announce(message);
+    } finally {
+      setCameraTestBusy(false);
+    }
+  }, [active, announce, cameraTestBusy]);
+
   return {
     active,
+    cameraTestBusy,
+    cameraTestError,
+    cameraTestFrame,
     describeScene,
     alert,
     errorMessage,
+    guidance,
+    safetyEnvelope,
     snapshot,
     start,
     status,
     stop,
     support,
+    testCamera,
   };
 }

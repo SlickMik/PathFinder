@@ -3,6 +3,14 @@ export type Risk = 'clear' | 'caution' | 'near' | 'critical' | 'unknown';
 export type Sector = 'left' | 'center' | 'right';
 export type Tracking = 'normal' | 'limited' | 'unavailable';
 export type DeviceAim = 'forward' | 'too-high' | 'too-low' | 'unstable';
+export type NavigationInstruction =
+  | 'hold'
+  | 'stop'
+  | 'straight'
+  | 'slight-left'
+  | 'left'
+  | 'slight-right'
+  | 'right';
 
 export type LidarSupport = {
   supported: boolean;
@@ -19,6 +27,9 @@ export type ObstacleSnapshot = {
   timestampMs: number;
   tracking: Tracking;
   deviceAim: DeviceAim;
+  motion: {
+    speedMps: number;
+  };
   left: SectorReading;
   center: SectorReading;
   right: SectorReading;
@@ -28,6 +39,37 @@ export type ObstacleSnapshot = {
     coverage: number;
     risk: Risk;
   };
+  route?: {
+    instruction: NavigationInstruction;
+    status: 'clear' | 'narrow' | 'blocked' | 'unknown';
+    minimumClearanceM: number | null;
+    openingWidthM: number | null;
+    headingDeltaDeg: number;
+    confidence: number;
+    isNarrowOpening: boolean;
+    goalDistanceM?: number;
+  };
+};
+
+export type SafetyEnvelope = {
+  speedMps: number;
+  reactionDistanceM: number;
+  brakingDistanceM: number;
+  warningDistanceM: number;
+  criticalDistanceM: number;
+  nearDistanceM: number;
+};
+
+export type NavigationGuidance = {
+  instruction: NavigationInstruction;
+  phrase: string | null;
+  confidence: number;
+  clearanceM: number | null;
+  openingWidthM: number | null;
+  isNarrowOpening: boolean;
+  source: 'lidar-route' | 'reactive-sectors' | 'none';
+  pendingInstruction: NavigationInstruction | null;
+  pendingFrameCount: number;
 };
 
 export type LidarOptions = {
@@ -66,4 +108,9 @@ export type CapturedFrame = {
   base64: string;
   width: number;
   height: number;
+};
+
+export type CameraTestFrame = CapturedFrame & {
+  uri: string;
+  capturedAtMs: number;
 };

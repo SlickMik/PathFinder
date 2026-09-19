@@ -33,6 +33,8 @@ final class LidarSession: NSObject, ARSessionDelegate {
   private var lastProcessedTimestamp: TimeInterval = 0
   private var lastCameraPosition: SIMD3<Float>?
   private var lastCameraForward: SIMD3<Float>?
+  private var speedSamples: [Float] = []
+  private var filteredSpeedMps: Float = 0
   private var floorHeight: Float?
   private var latestFrame: ARFrame?
   private let ciContext = CIContext()
@@ -89,7 +91,7 @@ final class LidarSession: NSObject, ARSessionDelegate {
       throw LidarSessionException("This device does not provide LiDAR scene depth.")
     }
 
-    configuration.planeDetection = [.horizontal]
+    configuration.planeDetection = [.horizontal, .vertical]
     configuration.environmentTexturing = .none
 
     processingQueue.sync {
@@ -99,6 +101,8 @@ final class LidarSession: NSObject, ARSessionDelegate {
       self.lastProcessedTimestamp = 0
       self.lastCameraPosition = nil
       self.lastCameraForward = nil
+      self.speedSamples.removeAll(keepingCapacity: true)
+      self.filteredSpeedMps = 0
       self.isRunning = true
       self.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
     }
@@ -114,6 +118,8 @@ final class LidarSession: NSObject, ARSessionDelegate {
       self.floorHeight = nil
       self.lastCameraPosition = nil
       self.lastCameraForward = nil
+      self.speedSamples.removeAll(keepingCapacity: true)
+      self.filteredSpeedMps = 0
     }
   }
 
@@ -176,6 +182,11 @@ final class LidarSession: NSObject, ARSessionDelegate {
         -cameraTransform.columns.2.y,
         -cameraTransform.columns.2.z
       ))
+      let speedMps = movementSpeed(
+        position: position,
+        deltaTime: deltaTime,
+        tracking: tracking
+      )
       let aim = deviceAim(
         forward: forward,
         position: position,
@@ -186,12 +197,16 @@ final class LidarSession: NSObject, ARSessionDelegate {
       lastCameraForward = forward
 
       guard tracking == "normal", aim == "forward" else {
-        emitSnapshot(processor.unknownSnapshot(tracking: tracking, aim: aim))
+        emitSnapshot(
+          processor.unknownSnapshot(tracking: tracking, aim: aim, speedMps: speedMps)
+        )
         return
       }
 
       guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
-        emitSnapshot(processor.unknownSnapshot(tracking: tracking, aim: aim))
+        emitSnapshot(
+          processor.unknownSnapshot(tracking: tracking, aim: aim, speedMps: speedMps)
+        )
         return
       }
 
@@ -201,7 +216,8 @@ final class LidarSession: NSObject, ARSessionDelegate {
         floorHeight: floorHeight,
         options: options,
         tracking: tracking,
-        aim: aim
+        aim: aim,
+        speedMps: speedMps
       )
       emitSnapshot(snapshot)
     }
@@ -224,18 +240,30 @@ final class LidarSession: NSObject, ARSessionDelegate {
   func sessionWasInterrupted(_ session: ARSession) {
     guard isRunning else { return }
     processor.reset()
+    speedSamples.removeAll(keepingCapacity: true)
+    filteredSpeedMps = 0
     emitError(
       code: "session-interrupted",
       message: "Tracking paused. Hold still and wait for the camera.",
       recoverable: true
     )
-    emitSnapshot(processor.unknownSnapshot(tracking: "unavailable", aim: "unstable"))
+    emitSnapshot(
+      processor.unknownSnapshot(
+        tracking: "unavailable",
+        aim: "unstable",
+        speedMps: filteredSpeedMps
+      )
+    )
   }
 
   func sessionInterruptionEnded(_ session: ARSession) {
     guard isRunning else { return }
     processor.reset()
     lastProcessedTimestamp = 0
+    lastCameraPosition = nil
+    lastCameraForward = nil
+    speedSamples.removeAll(keepingCapacity: true)
+    filteredSpeedMps = 0
     session.run(session.configuration ?? ARWorldTrackingConfiguration(), options: [.resetTracking])
   }
 
@@ -270,10 +298,42 @@ final class LidarSession: NSObject, ARSessionDelegate {
       let translationSpeed = simd_distance(position, previousPosition) / Float(deltaTime)
       let dotProduct = min(max(simd_dot(forward, previousForward), -1), 1)
       let angularSpeed = acos(dotProduct) / Float(deltaTime)
-      if translationSpeed > 2.4 || angularSpeed > 2.2 { return "unstable" }
+      if translationSpeed > 4.0 || angularSpeed > 2.2 { return "unstable" }
     }
 
     return "forward"
+  }
+
+  private func movementSpeed(
+    position: SIMD3<Float>,
+    deltaTime: TimeInterval,
+    tracking: String
+  ) -> Float {
+    guard tracking == "normal",
+          let previousPosition = lastCameraPosition,
+          deltaTime > 0,
+          deltaTime < 0.5 else {
+      filteredSpeedMps *= 0.8
+      return filteredSpeedMps < 0.04 ? 0 : filteredSpeedMps
+    }
+
+    let horizontalDelta = SIMD2<Float>(
+      position.x - previousPosition.x,
+      position.z - previousPosition.z
+    )
+    var rawSpeed = min(simd_length(horizontalDelta) / Float(deltaTime), 3.5)
+    if rawSpeed < 0.06 { rawSpeed = 0 }
+
+    speedSamples.append(rawSpeed)
+    if speedSamples.count > 7 {
+      speedSamples.removeFirst(speedSamples.count - 7)
+    }
+    let sorted = speedSamples.sorted()
+    let medianSpeed = sorted[sorted.count / 2]
+    let smoothing: Float = medianSpeed > filteredSpeedMps ? 0.5 : 0.22
+    filteredSpeedMps += (medianSpeed - filteredSpeedMps) * smoothing
+    if filteredSpeedMps < 0.04 { filteredSpeedMps = 0 }
+    return filteredSpeedMps
   }
 
   private func emitSnapshot(_ payload: Payload) {

@@ -10,7 +10,12 @@ function ensureAudioMode(): Promise<void> {
   audioReady ??= setAudioModeAsync({
     playsInSilentMode: true,
     interruptionMode: 'duckOthers',
+    allowsRecording: false,
     shouldPlayInBackground: false,
+    // A playback-only session uses the iPhone's loudspeaker instead of the
+    // receiver. Keep this explicit so adding voice input later cannot silently
+    // move navigation instructions to the earpiece.
+    shouldRouteThroughEarpiece: false,
   }).catch(() => {
     audioReady = null;
   });

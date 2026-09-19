@@ -1,13 +1,15 @@
 import {
+  DEFAULT_LIDAR_OPTIONS,
   MINIMUM_RELIABLE_COVERAGE,
-  RISK_THRESHOLDS_M,
   SAFER_FRAMES_TO_EXIT,
   UNKNOWN_FRAMES_TO_PAUSE,
 } from '../../config/thresholds';
+import { corridorRisk, safetyEnvelopeForSpeed } from './motionSafety';
 import type {
   AlertState,
   ObstacleSnapshot,
   Risk,
+  SafetyEnvelope,
   Sector,
   SectorReading,
 } from './types';
@@ -34,7 +36,13 @@ export const INITIAL_ALERT_STATE: AlertState = {
   announcement: null,
 };
 
-export function riskForReading(reading: SectorReading): Risk {
+export function riskForReading(
+  reading: SectorReading,
+  envelope: SafetyEnvelope = safetyEnvelopeForSpeed(
+    0,
+    DEFAULT_LIDAR_OPTIONS.reactionTimeS,
+  ),
+): Risk {
   if (
     reading.confidence === 'low' ||
     reading.coverage < MINIMUM_RELIABLE_COVERAGE
@@ -43,19 +51,25 @@ export function riskForReading(reading: SectorReading): Risk {
   }
 
   if (reading.distanceM === null) return 'clear';
-  if (reading.distanceM < RISK_THRESHOLDS_M.critical) return 'critical';
-  if (reading.distanceM < RISK_THRESHOLDS_M.near) return 'near';
-  if (reading.distanceM <= RISK_THRESHOLDS_M.caution) return 'caution';
+  if (reading.distanceM < envelope.criticalDistanceM) return 'critical';
+  if (reading.distanceM < envelope.nearDistanceM) return 'near';
+  if (reading.distanceM <= envelope.warningDistanceM) return 'caution';
   return 'clear';
 }
 
-export function dominantSector(snapshot: ObstacleSnapshot): Sector | null {
+export function dominantSector(
+  snapshot: ObstacleSnapshot,
+  envelope: SafetyEnvelope = safetyEnvelopeForSpeed(
+    snapshot.motion.speedMps,
+    DEFAULT_LIDAR_OPTIONS.reactionTimeS,
+  ),
+): Sector | null {
   const sectors: Array<{ sector: Sector; reading: SectorReading; risk: Risk }> = (
     ['left', 'center', 'right'] as const
   ).map((sector) => ({
     sector,
     reading: snapshot[sector],
-    risk: riskForReading(snapshot[sector]),
+    risk: riskForReading(snapshot[sector], envelope),
   }));
 
   const reliable = sectors.filter(({ risk }) => risk !== 'unknown');
@@ -86,9 +100,15 @@ function announcementFor(risk: Risk, direction: Sector | null): string | null {
 export function reduceAlertState(
   previous: AlertState,
   snapshot: ObstacleSnapshot,
+  envelope: SafetyEnvelope = safetyEnvelopeForSpeed(
+    snapshot.motion.speedMps,
+    DEFAULT_LIDAR_OPTIONS.reactionTimeS,
+  ),
 ): AlertState {
   const invalidView = snapshot.tracking !== 'normal' || snapshot.deviceAim !== 'forward';
-  const candidate: Risk = invalidView ? 'unknown' : snapshot.corridor.risk;
+  const candidate: Risk = invalidView
+    ? 'unknown'
+    : corridorRisk(snapshot, envelope, DEFAULT_LIDAR_OPTIONS.reactionTimeS);
 
   if (candidate === 'unknown') {
     const unknownFrameCount = previous.unknownFrameCount + 1;
@@ -106,7 +126,7 @@ export function reduceAlertState(
     };
   }
 
-  const direction = dominantSector(snapshot);
+  const direction = dominantSector(snapshot, envelope);
   const candidateRank = RISK_RANK[candidate];
   const previousRank = RISK_RANK[previous.risk];
   const riskIncreased = previous.risk === 'unknown' || candidateRank > previousRank;

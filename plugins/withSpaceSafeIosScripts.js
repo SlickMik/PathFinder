@@ -31,6 +31,22 @@ module.exports = function withSpaceSafeIosScripts(config) {
         String.raw`:script => "#{env_vars}\"$PODS_TARGET_SRCROOT/../scripts/get-app-config-ios.sh\"",`
       );
 
+      // Expo Constants also calls basename with the Xcode project directory
+      // unquoted. Without this patch, a Release build from a path containing a
+      // space creates an empty EXConstants.bundle and expo-linking crashes at
+      // launch because app.config is missing.
+      replaceIfPresent(
+        path.join(
+          projectRoot,
+          'node_modules',
+          'expo-constants',
+          'scripts',
+          'get-app-config-ios.sh'
+        ),
+        'PROJECT_DIR_BASENAME=$(basename $PROJECT_DIR)',
+        'PROJECT_DIR_BASENAME=$(basename "$PROJECT_DIR")'
+      );
+
       const appProject = fs
         .readdirSync(platformProjectRoot)
         .find((entry) => entry.endsWith('.xcodeproj'));

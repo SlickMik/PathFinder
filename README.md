@@ -1,9 +1,8 @@
 # PathFinder
 
-PathFinder is an iOS-first Expo development-build prototype that uses ARKit scene depth to
-provide local obstacle alerts. This implementation intentionally contains only the LiDAR
-functionality described in `plan.md`: no microphone, cloud service, GPT session, camera upload,
-or scene-description backend is included.
+PathFinder is an iOS-first Expo development-build prototype that combines ARKit LiDAR depth,
+on-device Vision person segmentation, and a local clearance-aware route planner to provide
+short-range indoor guidance.
 
 ## What is implemented
 
@@ -14,11 +13,21 @@ or scene-description backend is included.
 - Detected-floor removal, body-envelope filtering, three forward sectors, and walking-corridor risk
 - Conservative unknown states for low coverage, invalid aim, or degraded AR tracking
 - Stable TypeScript alert hysteresis and escalating haptic patterns
+- Speed-adaptive warning distance using reaction and braking-distance calculations
+- Stabilized local steering cues: straight, slight left/right, left/right, and stop
+- A three-second, world-locked free-space map with conservative unknown-space handling
+- Clearance-aware A* routing that inflates obstacles by body width plus a side margin
+- Narrow-opening guidance that only accepts an observed gap wide enough for that envelope
+- Apple's on-device person segmentation fused with LiDAR distance; person evidence expires quickly
+- On-device spoken steering through the iOS speech synthesizer
 - VoiceOver-friendly controls, large Dynamic Type, and an explicit safety boundary
 - Automatic sensor and alert shutdown when the app backgrounds or the device reaches critical heat
 
-All depth processing remains inside the Swift module. Only compact distances, confidence,
-coverage, tracking, aim, and risk values cross the React Native bridge.
+Depth, CV, mapping, and route planning remain inside the Swift module. Only compact distances,
+confidence, tracking, motion, risk, and route-guidance values cross the React Native bridge.
+
+The planner is deliberately local (about three metres), not building-scale turn-by-turn routing.
+It cannot guarantee that an opening, stair, drop-off, glass surface, or crossing is safe.
 
 ## Run on a LiDAR device
 
@@ -27,12 +36,13 @@ development build. Local native builds require Xcode and CocoaPods:
 
 ```sh
 npm install
-npx expo prebuild --platform ios --clean
+npx pod-install ios
 npx expo run:ios --device
 ```
 
-The project opts SDK 57 into Expo's iOS scene lifecycle support, which is required when
-building with Xcode 27/iOS 27. Re-run the clean prebuild after changing native configuration.
+Or open `ios/PathFinder.xcworkspace` in Xcode, select the PathFinder scheme and your connected
+iPhone, set your Apple Development team under Signing & Capabilities, and press Run. Open the
+workspace—not the `.xcodeproj`—so CocoaPods and the native LiDAR module are included.
 
 For a shared device build, configure Apple signing and run `eas build --profile development
 --platform ios`.

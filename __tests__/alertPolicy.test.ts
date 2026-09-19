@@ -19,6 +19,7 @@ const snapshot = (
   timestampMs: 1,
   tracking: 'normal',
   deviceAim: 'forward',
+  motion: { speedMps: 0 },
   left: reliable(2.8),
   center: reliable(distanceM),
   right: reliable(2.9),

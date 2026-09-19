@@ -24,6 +24,8 @@ final class DepthProcessor {
 
   private var obstacleMap: [VoxelKey: MapPoint] = [:]
   private var corridorHistory: [DistanceSample] = []
+  private let routePlanner = LocalRoutePlanner()
+  private let personSegmenter = PersonSegmenter()
   private let voxelSize: Float = 0.1
   private let mapLifetime: TimeInterval = 0.45
   private let sampleStride = 3
@@ -31,15 +33,18 @@ final class DepthProcessor {
   func reset() {
     obstacleMap.removeAll(keepingCapacity: true)
     corridorHistory.removeAll(keepingCapacity: true)
+    routePlanner.reset()
+    personSegmenter.reset()
   }
 
-  func unknownSnapshot(tracking: String, aim: String) -> Payload {
+  func unknownSnapshot(tracking: String, aim: String, speedMps: Float = 0) -> Payload {
     let unknown = sectorReading(distance: nil, confidence: "low", coverage: 0)
     corridorHistory.removeAll(keepingCapacity: true)
     return [
       "timestampMs": Date().timeIntervalSince1970 * 1000,
       "tracking": tracking,
       "deviceAim": aim,
+      "motion": ["speedMps": Double(speedMps)],
       "left": unknown,
       "center": unknown,
       "right": unknown,
@@ -48,7 +53,8 @@ final class DepthProcessor {
         "timeToContactS": NSNull(),
         "coverage": 0,
         "risk": "unknown"
-      ]
+      ],
+      "route": routePlanner.unknown()
     ]
   }
 
@@ -58,10 +64,11 @@ final class DepthProcessor {
     floorHeight: Float?,
     options: LidarSessionOptions,
     tracking: String,
-    aim: String
+    aim: String,
+    speedMps: Float
   ) -> Payload {
     guard let confidenceMap = depthData.confidenceMap else {
-      return unknownSnapshot(tracking: tracking, aim: aim)
+      return unknownSnapshot(tracking: tracking, aim: aim, speedMps: speedMps)
     }
 
     let depthMap = depthData.depthMap
@@ -70,8 +77,9 @@ final class DepthProcessor {
     guard width > 0, height > 0,
           width == CVPixelBufferGetWidth(confidenceMap),
           height == CVPixelBufferGetHeight(confidenceMap) else {
-      return unknownSnapshot(tracking: tracking, aim: aim)
+      return unknownSnapshot(tracking: tracking, aim: aim, speedMps: speedMps)
     }
+    let personMask = personSegmenter.mask(for: frame)
 
     CVPixelBufferLockBaseAddress(depthMap, .readOnly)
     CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
@@ -82,7 +90,7 @@ final class DepthProcessor {
 
     guard let depthBase = CVPixelBufferGetBaseAddress(depthMap),
           let confidenceBase = CVPixelBufferGetBaseAddress(confidenceMap) else {
-      return unknownSnapshot(tracking: tracking, aim: aim)
+      return unknownSnapshot(tracking: tracking, aim: aim, speedMps: speedMps)
     }
 
     let transform = frame.camera.transform
@@ -93,7 +101,7 @@ final class DepthProcessor {
     )
     let rawForward = SIMD3<Float>(-transform.columns.2.x, 0, -transform.columns.2.z)
     guard simd_length(rawForward) > 0.001 else {
-      return unknownSnapshot(tracking: tracking, aim: "unstable")
+      return unknownSnapshot(tracking: tracking, aim: "unstable", speedMps: speedMps)
     }
     let forward = simd_normalize(rawForward)
     let right = simd_normalize(simd_cross(forward, SIMD3<Float>(0, 1, 0)))
@@ -107,7 +115,7 @@ final class DepthProcessor {
     let cx = intrinsics.columns.2.x * widthScale
     let cy = intrinsics.columns.2.y * heightScale
     guard fx > 0, fy > 0 else {
-      return unknownSnapshot(tracking: tracking, aim: "unstable")
+      return unknownSnapshot(tracking: tracking, aim: "unstable", speedMps: speedMps)
     }
 
     let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
@@ -158,6 +166,22 @@ final class DepthProcessor {
 
         let relativeHeight = worldPoint.y - cameraPosition.y
         let onDetectedFloor = floorHeight.map { abs(worldPoint.y - $0) < 0.08 } ?? false
+        let isPerson = personMask?.contains(
+          depthX: pixelX,
+          depthY: pixelY,
+          depthWidth: width,
+          depthHeight: height
+        ) ?? false
+        let isRouteObstacle = isPerson || (!onDetectedFloor && relativeHeight > -1.30)
+        if ((pixelX / sampleStride) + (pixelY / sampleStride)).isMultiple(of: 2) {
+          routePlanner.observeRay(
+            from: cameraPosition,
+            to: worldPoint,
+            isObstacle: isRouteObstacle,
+            isPerson: isPerson,
+            timestamp: now
+          )
+        }
         guard relativeHeight >= -1.65, relativeHeight <= 1.0, !onDetectedFloor else { continue }
 
         let key = VoxelKey(
@@ -218,13 +242,22 @@ final class DepthProcessor {
       distance: corridorDistance,
       timeToContact: timeToContact,
       coverage: corridorCoverage,
-      reactionTime: options.reactionTimeS
+      reactionTime: options.reactionTimeS,
+      speedMps: speedMps,
+      maximumDistanceM: Float(options.maximumDistanceM)
+    )
+    let route = routePlanner.guidance(
+      cameraPosition: cameraPosition,
+      forward: forward,
+      right: right,
+      timestamp: now
     )
 
     return [
       "timestampMs": Date().timeIntervalSince1970 * 1000,
       "tracking": tracking,
       "deviceAim": aim,
+      "motion": ["speedMps": Double(speedMps)],
       "left": sectorReading(
         distance: leftDistance,
         confidence: confidenceLabel(sectorConfidenceValues[0] + sectorMapConfidence[0]),
@@ -245,7 +278,8 @@ final class DepthProcessor {
         "timeToContactS": bridgeNumber(timeToContact),
         "coverage": corridorCoverage,
         "risk": corridorRisk
-      ]
+      ],
+      "route": route
     ]
   }
 
@@ -328,14 +362,35 @@ final class DepthProcessor {
     distance: Float?,
     timeToContact: Float?,
     coverage: Double,
-    reactionTime: Double
+    reactionTime: Double,
+    speedMps: Float,
+    maximumDistanceM: Float
   ) -> String {
     guard coverage >= 0.22 else { return "unknown" }
     guard let distance else { return "clear" }
-    if distance < 0.6 { return "critical" }
-    if let timeToContact, timeToContact <= Float(reactionTime) { return "critical" }
-    if distance < 1.2 { return "near" }
-    if distance <= 2.0 { return "caution" }
+
+    let speed = min(max(speedMps, 0), 2.5)
+    let reactionDistance = speed * Float(reactionTime)
+    let brakingDistance = speed * speed / (2 * 1.4)
+    let warningDistance = min(
+      max(0.6 + reactionDistance + brakingDistance, 2.0),
+      maximumDistanceM
+    )
+    let criticalDistance = min(0.6 + speed * 0.2, warningDistance - 0.75)
+    let nearDistance = min(
+      max(1.2 + speed * 0.45, criticalDistance + 0.35),
+      warningDistance - 0.35
+    )
+
+    if distance < criticalDistance { return "critical" }
+    if let timeToContact,
+       timeToContact <= max(0.65, Float(reactionTime) * 0.5) { return "critical" }
+    if distance < nearDistance { return "near" }
+    if let timeToContact,
+       timeToContact <= Float(reactionTime) { return "near" }
+    if distance <= warningDistance { return "caution" }
+    if let timeToContact,
+       timeToContact <= Float(reactionTime) + 1 { return "caution" }
     return "clear"
   }
 }
