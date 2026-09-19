@@ -69,6 +69,8 @@ Style:
 - Acknowledge journey moments casually ("Alright, out the door — feels like a good morning for it.").
 - Remember and refer back to earlier parts of the conversation and journey.
 - If a camera frame is attached, weave what you actually see into the conversation naturally; mention hazards first.
+- You always receive live LiDAR context. When asked what's ahead, around, or how far something is — answer directly from the LiDAR sector distances, corridor reading, and alert state, even with no image. Convert meters to natural speech ("about a meter and a half ahead on your left").
+- If LiDAR shows a sector as unknown, say you can't read that side rather than guessing.
 - Use approximate distances only when the provided LiDAR context supports them.
 
 Hard safety rules (never break these, even if asked):
@@ -118,14 +120,36 @@ function lidarContextText(lidar) {
     s && typeof s.distanceM === 'number'
       ? `${s.distanceM.toFixed(1)} m (confidence ${s.confidence ?? 'unknown'})`
       : 'unknown';
-  return [
-    `LiDAR context (device depth sensor, moments before the photo):`,
+  const lines = [
+    `Live LiDAR context (device depth sensor, right now):`,
     `- nearest obstacle left: ${sector(lidar.left)}`,
     `- nearest obstacle center: ${sector(lidar.center)}`,
     `- nearest obstacle right: ${sector(lidar.right)}`,
     `- walking-corridor risk: ${lidar.corridorRisk ?? 'unknown'}`,
     `- tracking quality: ${lidar.tracking ?? 'unknown'}`,
-  ].join('\n');
+  ];
+  if (typeof lidar.corridorDistanceM === 'number') {
+    lines.push(`- nearest obstacle in walking corridor: ${lidar.corridorDistanceM.toFixed(1)} m`);
+  }
+  if (typeof lidar.timeToContactS === 'number') {
+    lines.push(`- estimated time to contact: ${lidar.timeToContactS.toFixed(1)} s`);
+  }
+  if (lidar.alert && typeof lidar.alert.risk === 'string') {
+    lines.push(
+      `- current alert state: ${lidar.alert.risk}${lidar.alert.direction ? `, direction ${lidar.alert.direction}` : ''}`,
+    );
+  }
+  if (lidar.guidance && typeof lidar.guidance.instruction === 'string') {
+    const g = lidar.guidance;
+    const extras = [
+      typeof g.clearanceM === 'number' ? `clearance ${g.clearanceM.toFixed(1)} m` : null,
+      typeof g.openingWidthM === 'number' ? `opening ${g.openingWidthM.toFixed(1)} m wide` : null,
+    ]
+      .filter(Boolean)
+      .join(', ');
+    lines.push(`- suggested direction from route planner: ${g.instruction}${extras ? ` (${extras})` : ''}`);
+  }
+  return lines.join('\n');
 }
 
 function sanitizeHistory(history) {

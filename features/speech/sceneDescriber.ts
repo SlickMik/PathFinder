@@ -12,6 +12,8 @@ type LidarContext = {
   center: { distanceM: number; confidence: string } | null;
   right: { distanceM: number; confidence: string } | null;
   corridorRisk: string;
+  corridorDistanceM: number | null;
+  timeToContactS: number | null;
   tracking: string;
   ageMs: number;
 };
@@ -31,6 +33,14 @@ export function compactLidarContext(snapshot: ObstacleSnapshot | null): LidarCon
     center: compactSector(snapshot.center),
     right: compactSector(snapshot.right),
     corridorRisk: snapshot.corridor.risk,
+    corridorDistanceM:
+      snapshot.corridor.distanceM !== null
+        ? Math.round(snapshot.corridor.distanceM * 10) / 10
+        : null,
+    timeToContactS:
+      snapshot.corridor.timeToContactS !== null
+        ? Math.round(snapshot.corridor.timeToContactS * 10) / 10
+        : null,
     tracking: snapshot.tracking,
     ageMs: Math.max(0, Date.now() - snapshot.timestampMs),
   };

@@ -327,6 +327,8 @@ export function useLidarScanner() {
         const wantsToSee = /\b(see|look|front|around|ahead|describe|view)\b/i.test(text);
         const reply = await companionSay(text, {
           snapshot: snapshotRef.current,
+          alert: alertRef.current,
+          guidance: guidanceRef.current,
           withFrame: wantsToSee && active,
         });
         console.log(`[companion] reply: "${reply}"`);

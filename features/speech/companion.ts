@@ -1,6 +1,6 @@
 import { ExpoLidarVision } from '../../modules/expo-lidar-vision';
 import { compactLidarContext } from './sceneDescriber';
-import type { ObstacleSnapshot } from '../scanning/types';
+import type { AlertState, NavigationGuidance, ObstacleSnapshot } from '../scanning/types';
 
 // Companion mode: turns the journey into a running conversation with a warm
 // voice ("Path") instead of terse announcements. Deterministic obstacle
@@ -24,6 +24,8 @@ export function resetCompanion(): void {
 
 type CompanionOptions = {
   snapshot?: ObstacleSnapshot | null;
+  alert?: AlertState | null;
+  guidance?: NavigationGuidance | null;
   withFrame?: boolean;
 };
 
@@ -38,7 +40,7 @@ export function companionSay(text: string, options: CompanionOptions = {}): Prom
 
 async function requestReply(
   text: string,
-  { snapshot = null, withFrame = false }: CompanionOptions,
+  { snapshot = null, alert = null, guidance = null, withFrame = false }: CompanionOptions,
 ): Promise<string> {
   if (!COMPANION_URL) throw new Error('Companion backend is not configured.');
   console.log(`[companion] POST ${COMPANION_URL} (frame=${withFrame})`);
@@ -58,7 +60,19 @@ async function requestReply(
       body: JSON.stringify({
         text,
         history,
-        lidar: compactLidarContext(snapshot),
+        lidar: {
+          ...(compactLidarContext(snapshot) ?? {}),
+          alert: alert ? { risk: alert.risk, direction: alert.direction } : null,
+          guidance:
+            guidance && guidance.instruction !== 'hold'
+              ? {
+                  instruction: guidance.instruction,
+                  clearanceM: guidance.clearanceM,
+                  openingWidthM: guidance.openingWidthM,
+                  confidence: guidance.confidence,
+                }
+              : null,
+        },
         ...(frame ? { imageBase64: frame.base64, mimeType: 'image/jpeg' } : {}),
       }),
     });
