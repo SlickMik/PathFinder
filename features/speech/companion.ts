@@ -45,7 +45,8 @@ async function requestReply(
   if (!COMPANION_URL) throw new Error('Companion backend is not configured.');
   console.log(`[companion] POST ${COMPANION_URL} (frame=${withFrame})`);
 
-  const frame = withFrame ? await ExpoLidarVision.captureFrame(768, 0.6) : null;
+  // 512px halves the vision-token count vs 768px — fastest useful size.
+  const frame = withFrame ? await ExpoLidarVision.captureFrame(512, 0.5) : null;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 

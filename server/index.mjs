@@ -36,6 +36,9 @@ const MODEL = process.env.BASETEN_MODEL ?? 'zai-org/GLM-5.3-Flash';
 // Conversational companion model — Moonshot AI's Kimi is chatty AND accepts
 // images, so one model can both banter and see.
 const COMPANION_MODEL = process.env.BASETEN_COMPANION_MODEL ?? 'moonshotai/Kimi-K2.6';
+// Fastest vision-capable GPU model on Baseten — used for any turn that
+// carries a camera frame so replies come back quicker.
+const FAST_VISION_MODEL = process.env.BASETEN_FAST_VISION_MODEL ?? 'zai-org/GLM-5.3-Flash';
 const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
 const BASETEN_URL = 'https://inference.baseten.co/v1/chat/completions';
 
@@ -194,7 +197,9 @@ async function companionChat({ text, history, imageBase64, mimeType, lidar }) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: COMPANION_MODEL,
+        // Vision turns go to the fastest GPU model; text-only chat keeps the
+        // more conversational model.
+        model: imageBase64 ? FAST_VISION_MODEL : COMPANION_MODEL,
         temperature: 0.7,
         max_tokens: 90,
         messages: [
@@ -237,7 +242,7 @@ async function describeScene({ imageBase64, mimeType, lidar }) {
       body: JSON.stringify({
         model: MODEL,
         temperature: 0.2,
-        max_tokens: 220,
+        max_tokens: 160,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           {
@@ -341,6 +346,32 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Pre-open the TLS connection to Baseten so the first real request skips the
+// handshake (~300ms). Keep-alive in Node's fetch pool reuses it afterwards.
+async function warmUpstream() {
+  try {
+    const started = Date.now();
+    await fetch(BASETEN_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${BASETEN_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: FAST_VISION_MODEL,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    console.log(`[warmup] Baseten connection ready in ${Date.now() - started}ms`);
+  } catch (error) {
+    console.warn(`[warmup] failed (non-fatal): ${error.message}`);
+  }
+}
+
 server.listen(PORT, () => {
-  console.log(`PathFinder scene proxy listening on http://0.0.0.0:${PORT} (model: ${MODEL})`);
+  console.log(
+    `PathFinder scene proxy listening on http://0.0.0.0:${PORT} (describe: ${MODEL}, chat: ${COMPANION_MODEL}, vision: ${FAST_VISION_MODEL})`,
+  );
+  void warmUpstream();
 });

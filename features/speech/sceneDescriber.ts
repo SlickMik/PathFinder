@@ -62,7 +62,8 @@ export function describeCurrentScene(snapshot: ObstacleSnapshot | null = null): 
 async function requestDescription(snapshot: ObstacleSnapshot | null): Promise<string> {
   if (!SCENE_URL) throw new Error('Scene description backend is not configured.');
 
-  const frame = await ExpoLidarVision.captureFrame(768, 0.6);
+  // 512px halves the vision-token count vs 768px — fastest useful size.
+  const frame = await ExpoLidarVision.captureFrame(512, 0.5);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
