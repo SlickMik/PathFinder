@@ -49,6 +49,7 @@ export function useLidarScanner() {
   const [companion, setCompanionState] = useState(false);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({ instruction: 'hold', timestamp: 0 });
+  const lastAlertSpeechRef = useRef({ text: '', timestamp: 0 });
 
   useEffect(() => {
     let cancelled = false;
@@ -136,7 +137,18 @@ export function useLidarScanner() {
       if (viewValid) setErrorMessage(null);
 
       if (nextAlert.announcement) {
-        announce(nextAlert.announcement, nextAlert.risk === 'critical');
+        // Alert speech pacing. Without this, sector flapping (left/center)
+        // re-announces at up to 10 Hz and critical alerts interrupt
+        // themselves constantly.
+        const critical = nextAlert.risk === 'critical';
+        const now = Date.now();
+        const last = lastAlertSpeechRef.current;
+        const repeatSameText = last.text === nextAlert.announcement && now - last.timestamp < 2500;
+        const tooSoonForNonCritical = !critical && now - last.timestamp < 3000;
+        if (!repeatSameText && !tooSoonForNonCritical) {
+          lastAlertSpeechRef.current = { text: nextAlert.announcement, timestamp: now };
+          announce(nextAlert.announcement, critical);
+        }
       }
     });
 
@@ -306,6 +318,24 @@ export function useLidarScanner() {
     }
   }, [active, announce]);
 
+  const askCompanion = useCallback(
+    async (text: string) => {
+      try {
+        // The user spoke — cut off any ongoing narration immediately.
+        await stopSpeaking();
+        const wantsToSee = /\b(see|look|front|around|ahead|describe|view)\b/i.test(text);
+        const reply = await companionSay(text, {
+          snapshot: snapshotRef.current,
+          withFrame: wantsToSee && active,
+        });
+        announce(reply, true);
+      } catch {
+        announce('Companion is unavailable right now.');
+      }
+    },
+    [active, announce],
+  );
+
   const toggleCompanion = useCallback(() => {
     const next = !companionRef.current;
     companionRef.current = next;
@@ -325,6 +355,7 @@ export function useLidarScanner() {
 
   return {
     active,
+    askCompanion,
     companion,
     toggleCompanion,
     describeScene,

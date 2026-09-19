@@ -3,6 +3,7 @@ import { RouteDebugOverlay } from '../components/RouteDebugOverlay';
 import { SectorStatus } from '../components/SectorStatus';
 import { StatusAnnouncement } from '../components/StatusAnnouncement';
 import { useLidarScanner } from '../features/scanning/useLidarScanner';
+import { useVoiceInput } from '../features/speech/useVoiceInput';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -26,6 +27,7 @@ const GUIDANCE_LABEL = {
 
 export default function ScannerScreen() {
   const scanner = useLidarScanner();
+  const voice = useVoiceInput((text) => void scanner.askCompanion(text));
   const visibleRisk = scanner.active ? scanner.alert.risk : 'unknown';
   const riskLabel = RISK_LABEL[visibleRisk];
   const riskDetail =
@@ -199,6 +201,21 @@ export default function ScannerScreen() {
             {scanner.companion ? 'Companion mode: on' : 'Companion mode: off'}
           </Text>
         </Pressable>
+
+        {scanner.companion ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Hold to talk"
+            accessibilityHint="Hold down, speak your question, then release to send it."
+            onPressIn={() => void voice.start()}
+            onPressOut={() => voice.stop()}
+            style={[styles.talk, voice.listening && styles.talkActive]}
+          >
+            <Text maxFontSizeMultiplier={1.6} style={styles.talkText}>
+              {voice.listening ? 'Listening… release to send' : 'Hold to talk'}
+            </Text>
+          </Pressable>
+        ) : null}
 
         <View style={styles.safetyNote}>
           <Text maxFontSizeMultiplier={2} style={styles.safetyTitle}>
@@ -439,6 +456,21 @@ const styles = StyleSheet.create({
     backgroundColor: '#2E331A',
     borderColor: '#F2FF63',
     borderWidth: 2,
+  },
+  talk: {
+    minHeight: 72,
+    borderRadius: 16,
+    backgroundColor: '#F2FF63',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  talkActive: {
+    backgroundColor: '#FF6B66',
+  },
+  talkText: {
+    color: '#0B0D10',
+    fontSize: 18,
+    fontWeight: '900',
   },
   describeText: {
     color: '#F2FF63',
