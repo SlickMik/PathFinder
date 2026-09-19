@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "PathFinder",
+    "slug": "pathfinder-lidar",
+    "scheme": "pathfinder",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "plugins": [
+      "expo-router",
+      "./plugins/withSpaceSafeIosScripts",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "enableSceneSupport": true
+          }
+        }
+      ],
+      ["expo-audio", { "microphonePermission": false }]
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.pathfinder.lidar",
+      "deploymentTarget": "16.4",
+      "infoPlist": {
+        "NSCameraUsageDescription": "PathFinder uses the camera and LiDAR sensor to detect nearby obstacles while you choose to scan.",
+        "UIBackgroundModes": []
+      }
+    },
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
