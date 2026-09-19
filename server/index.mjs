@@ -1,0 +1,207 @@
+// PathFinder scene-description proxy.
+//
+// Holds the Baseten API key server-side (never ship it in the Expo bundle),
+// accepts a single deliberately captured camera frame plus compact LiDAR
+// context, and returns a short, uncertainty-aware description.
+//
+// Zero dependencies — runs on Node 18+ (built-in fetch).
+//
+//   node server/index.mjs
+//
+// Env (server/.env or process env):
+//   BASETEN_API_KEY    required
+//   BASETEN_MODEL      default: zai-org/GLM-5.3-Flash
+//   APP_SHARED_SECRET  optional; if set, requests must send x-app-secret
+//   PORT               default: 8787
+
+import http from 'node:http';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// --- tiny .env loader (no dotenv dependency) -------------------------------
+const here = path.dirname(fileURLToPath(import.meta.url));
+try {
+  for (const line of readFileSync(path.join(here, '.env'), 'utf8').split('\n')) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (match && !(match[1] in process.env)) process.env[match[1]] = match[2];
+  }
+} catch {
+  // no .env file; rely on process env
+}
+
+const PORT = Number(process.env.PORT ?? 8787);
+const BASETEN_API_KEY = process.env.BASETEN_API_KEY;
+const MODEL = process.env.BASETEN_MODEL ?? 'zai-org/GLM-5.3-Flash';
+const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
+const BASETEN_URL = 'https://inference.baseten.co/v1/chat/completions';
+
+const MAX_BODY_BYTES = 8 * 1024 * 1024; // one compressed 768px JPEG fits easily
+const UPSTREAM_TIMEOUT_MS = 25_000;
+const RATE_LIMIT = { windowMs: 60_000, max: 12 }; // per client IP
+
+if (!BASETEN_API_KEY) {
+  console.error('BASETEN_API_KEY is not set. Create server/.env (see .env.example).');
+  process.exit(1);
+}
+
+// Encodes the description policy from PLAN.md §8. Kept server-side so the
+// client can never weaken it.
+const SYSTEM_PROMPT = `You describe a single camera frame for a blind or low-vision pedestrian.
+
+Rules:
+- Lead with immediate, visually apparent hazards, then layout, then useful landmarks.
+- Use left / center / right directions consistently (from the camera's point of view).
+- LiDAR context may be provided. Use approximate distances ONLY when they are supported by that LiDAR context; otherwise use relative terms like "close" or "farther away".
+- Distinguish observation from inference. Say "I see a red octagonal sign" rather than asserting its meaning if text is unreadable.
+- State uncertainty briefly: "possibly a glass door", "I can't confirm".
+- NEVER say a path, road, stairway, or crossing is "safe" or "clear to proceed". You may say a direction "appears more open" at most.
+- Do not identify people or infer sensitive personal traits (age, ethnicity, disability, etc.). "A person standing near the doorway" is enough.
+- Keep it short: 1-3 plain sentences the first time. No markdown, no lists, no preamble.`;
+
+// --- naive per-IP rate limiter ---------------------------------------------
+const hits = new Map();
+function rateLimited(ip) {
+  const now = Date.now();
+  const recent = (hits.get(ip) ?? []).filter((t) => now - t < RATE_LIMIT.windowMs);
+  recent.push(now);
+  hits.set(ip, recent);
+  return recent.length > RATE_LIMIT.max;
+}
+
+function send(res, status, body) {
+  const json = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(json);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(Object.assign(new Error('Payload too large.'), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function lidarContextText(lidar) {
+  if (!lidar || typeof lidar !== 'object') return 'No LiDAR context provided.';
+  // Only pass through the compact, expected fields — never trust extra data.
+  const sector = (s) =>
+    s && typeof s.distanceM === 'number'
+      ? `${s.distanceM.toFixed(1)} m (confidence ${s.confidence ?? 'unknown'})`
+      : 'unknown';
+  return [
+    `LiDAR context (device depth sensor, moments before the photo):`,
+    `- nearest obstacle left: ${sector(lidar.left)}`,
+    `- nearest obstacle center: ${sector(lidar.center)}`,
+    `- nearest obstacle right: ${sector(lidar.right)}`,
+    `- walking-corridor risk: ${lidar.corridorRisk ?? 'unknown'}`,
+    `- tracking quality: ${lidar.tracking ?? 'unknown'}`,
+  ].join('\n');
+}
+
+async function describeScene({ imageBase64, mimeType, lidar }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  try {
+    const response = await fetch(BASETEN_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${BASETEN_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        temperature: 0.2,
+        max_tokens: 220,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `${lidarContextText(lidar)}\n\nDescribe this scene for the pedestrian now.`,
+              },
+              {
+                type: 'image_url',
+                image_url: { url: `data:${mimeType};base64,${imageBase64}` },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw Object.assign(
+        new Error(`Baseten error ${response.status}: ${detail.slice(0, 300)}`),
+        { status: 502 },
+      );
+    }
+
+    const data = await response.json();
+    const description = data.choices?.[0]?.message?.content?.trim();
+    if (!description) throw Object.assign(new Error('Empty model response.'), { status: 502 });
+    return { description, usage: data.usage ?? null };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  const started = Date.now();
+  const ip = req.socket.remoteAddress ?? 'unknown';
+
+  if (req.method === 'GET' && req.url === '/health') {
+    return send(res, 200, { ok: true, model: MODEL });
+  }
+  if (req.method !== 'POST' || req.url !== '/describe-scene') {
+    return send(res, 404, { error: 'Not found.' });
+  }
+  if (SHARED_SECRET && req.headers['x-app-secret'] !== SHARED_SECRET) {
+    return send(res, 401, { error: 'Unauthorized.' });
+  }
+  if (rateLimited(ip)) {
+    return send(res, 429, { error: 'Too many requests.' });
+  }
+
+  try {
+    const body = JSON.parse(await readBody(req));
+    const { imageBase64, mimeType = 'image/jpeg', lidar } = body ?? {};
+    if (typeof imageBase64 !== 'string' || imageBase64.length < 100) {
+      return send(res, 400, { error: 'imageBase64 is required.' });
+    }
+    if (!['image/jpeg', 'image/png'].includes(mimeType)) {
+      return send(res, 400, { error: 'Unsupported mimeType.' });
+    }
+
+    const { description, usage } = await describeScene({ imageBase64, mimeType, lidar });
+
+    // Log request metadata only — never the frame, LiDAR data, or description.
+    console.log(
+      `[describe-scene] ok ${Date.now() - started}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+    );
+    return send(res, 200, { description });
+  } catch (error) {
+    const status = error?.status ?? (error?.name === 'AbortError' ? 504 : 500);
+    console.error(`[describe-scene] fail ${Date.now() - started}ms status=${status}: ${error.message}`);
+    return send(res, status, { error: 'Scene description failed.' });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`PathFinder scene proxy listening on http://0.0.0.0:${PORT} (model: ${MODEL})`);
+});

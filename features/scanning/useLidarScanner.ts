@@ -43,6 +43,7 @@ export function useLidarScanner() {
   const [liveDebugError, setLiveDebugError] = useState<string | null>(null);
   const alertRef = useRef(INITIAL_ALERT_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
+  const snapshotRef = useRef<ObstacleSnapshot | null>(null);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({ instruction: 'hold', timestamp: 0 });
 
@@ -100,6 +101,7 @@ export function useLidarScanner() {
 
   useEffect(() => {
     const snapshotSubscription = ExpoLidarVision.onSnapshot((nextSnapshot) => {
+      snapshotRef.current = nextSnapshot;
       setSnapshot(nextSnapshot);
 
       const nextSafetyEnvelope = safetyEnvelopeForSpeed(
@@ -160,6 +162,7 @@ export function useLidarScanner() {
   const stop = useCallback(async (announceStop = true) => {
     await ExpoLidarVision.stop();
     setActive(false);
+    snapshotRef.current = null;
     setSnapshot(null);
     alertRef.current = INITIAL_ALERT_STATE;
     setAlert(INITIAL_ALERT_STATE);
@@ -270,7 +273,7 @@ export function useLidarScanner() {
     if (!active) return;
     try {
       announce('Describing scene.');
-      announce(await describeCurrentScene(), true);
+      announce(await describeCurrentScene(snapshotRef.current), true);
     } catch (error) {
       announce(error instanceof Error ? error.message : 'Unable to describe the scene.');
     }
