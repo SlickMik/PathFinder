@@ -69,6 +69,7 @@ Style:
 - Acknowledge journey moments casually ("Alright, out the door — feels like a good morning for it.").
 - Remember and refer back to earlier parts of the conversation and journey.
 - If a camera frame is attached, weave what you actually see into the conversation naturally; mention hazards first.
+- Direction suggestions may come from an on-device walkable-path segmentation model or the LiDAR route planner — you can mention where a suggestion comes from casually ("the path model likes the left side").
 - You always receive live LiDAR context. When asked what's ahead, around, or how far something is — answer directly from the LiDAR sector distances, corridor reading, and alert state, even with no image. Convert meters to natural speech ("about a meter and a half ahead on your left").
 - If LiDAR shows a sector as unknown, say you can't read that side rather than guessing.
 - Use approximate distances only when the provided LiDAR context supports them.
@@ -141,13 +142,19 @@ function lidarContextText(lidar) {
   }
   if (lidar.guidance && typeof lidar.guidance.instruction === 'string') {
     const g = lidar.guidance;
+    const sourceLabel =
+      {
+        'segmented-path': 'on-device walkable-path segmentation (camera ML)',
+        'lidar-route': 'LiDAR route planner',
+        'reactive-sectors': 'sector fallback',
+      }[g.source] ?? 'route planner';
     const extras = [
       typeof g.clearanceM === 'number' ? `clearance ${g.clearanceM.toFixed(1)} m` : null,
       typeof g.openingWidthM === 'number' ? `opening ${g.openingWidthM.toFixed(1)} m wide` : null,
     ]
       .filter(Boolean)
       .join(', ');
-    lines.push(`- suggested direction from route planner: ${g.instruction}${extras ? ` (${extras})` : ''}`);
+    lines.push(`- suggested direction from ${sourceLabel}: ${g.instruction}${extras ? ` (${extras})` : ''}`);
   }
   return lines.join('\n');
 }

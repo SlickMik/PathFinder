@@ -45,8 +45,10 @@ export function useLidarScanner() {
   const alertRef = useRef(INITIAL_ALERT_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
   const snapshotRef = useRef<ObstacleSnapshot | null>(null);
-  const companionRef = useRef(false);
-  const [companion, setCompanionState] = useState(false);
+  // Sponsor experience (Baseten-powered companion) is on by default;
+  // deterministic local alerts still take priority over all of it.
+  const companionRef = useRef(true);
+  const [companion, setCompanionState] = useState(true);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({ instruction: 'hold', timestamp: 0 });
   const lastAlertSpeechRef = useRef({ text: '', timestamp: 0 });

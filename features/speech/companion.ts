@@ -70,6 +70,7 @@ async function requestReply(
                   clearanceM: guidance.clearanceM,
                   openingWidthM: guidance.openingWidthM,
                   confidence: guidance.confidence,
+                  source: guidance.source,
                 }
               : null,
         },
