@@ -113,6 +113,7 @@ function lidarContextText(lidar) {
 async function describeScene({ imageBase64, mimeType, lidar }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  const upstreamStart = Date.now();
   try {
     const response = await fetch(BASETEN_URL, {
       method: 'POST',
@@ -155,7 +156,7 @@ async function describeScene({ imageBase64, mimeType, lidar }) {
     const data = await response.json();
     const description = data.choices?.[0]?.message?.content?.trim();
     if (!description) throw Object.assign(new Error('Empty model response.'), { status: 502 });
-    return { description, usage: data.usage ?? null };
+    return { description, usage: data.usage ?? null, upstreamMs: Date.now() - upstreamStart };
   } finally {
     clearTimeout(timer);
   }
@@ -188,11 +189,16 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, { error: 'Unsupported mimeType.' });
     }
 
-    const { description, usage } = await describeScene({ imageBase64, mimeType, lidar });
+    const { description, usage, upstreamMs } = await describeScene({ imageBase64, mimeType, lidar });
 
+    // Proxy overhead = everything we add on top of the model call (parsing,
+    // validation, serialization). Budget: < 15 ms.
+    const totalMs = Date.now() - started;
+    const overheadMs = totalMs - upstreamMs;
+    res.setHeader('Server-Timing', `upstream;dur=${upstreamMs}, proxy;dur=${overheadMs}`);
     // Log request metadata only — never the frame, LiDAR data, or description.
     console.log(
-      `[describe-scene] ok ${Date.now() - started}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+      `[describe-scene] ok total=${totalMs}ms upstream=${upstreamMs}ms overhead=${overheadMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
     );
     return send(res, 200, { description });
   } catch (error) {
