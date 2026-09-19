@@ -185,6 +185,21 @@ export default function ScannerScreen() {
           </Text>
         </Pressable>
 
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ selected: scanner.companion }}
+          accessibilityLabel={
+            scanner.companion ? 'Turn off companion mode' : 'Turn on companion mode'
+          }
+          accessibilityHint="Companion mode talks with you like a friend during your journey."
+          onPress={() => scanner.toggleCompanion()}
+          style={[styles.describe, scanner.companion && styles.companionOn]}
+        >
+          <Text maxFontSizeMultiplier={1.6} style={styles.describeText}>
+            {scanner.companion ? 'Companion mode: on' : 'Companion mode: off'}
+          </Text>
+        </Pressable>
+
         <View style={styles.safetyNote}>
           <Text maxFontSizeMultiplier={2} style={styles.safetyTitle}>
             Supplemental aid only
@@ -419,6 +434,11 @@ const styles = StyleSheet.create({
   },
   describeDisabled: {
     opacity: 0.4,
+  },
+  companionOn: {
+    backgroundColor: '#2E331A',
+    borderColor: '#F2FF63',
+    borderWidth: 2,
   },
   describeText: {
     color: '#F2FF63',

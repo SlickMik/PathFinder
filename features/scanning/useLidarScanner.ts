@@ -4,6 +4,7 @@ import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
+import { companionSay, resetCompanion } from '../speech/companion';
 import { describeCurrentScene } from '../speech/sceneDescriber';
 import { speak, stopSpeaking } from '../speech/speech';
 import { emitRiskHaptic, hapticIntervalMs } from './haptics';
@@ -44,6 +45,8 @@ export function useLidarScanner() {
   const alertRef = useRef(INITIAL_ALERT_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
   const snapshotRef = useRef<ObstacleSnapshot | null>(null);
+  const companionRef = useRef(false);
+  const [companion, setCompanionState] = useState(false);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({ instruction: 'hold', timestamp: 0 });
 
@@ -175,7 +178,14 @@ export function useLidarScanner() {
     setStatus((current) => (current === 'unsupported' ? current : 'ready'));
     deactivateKeepAwake(KEEP_AWAKE_TAG);
     void stopSpeaking();
-    if (announceStop) void speak('Obstacle alerts stopped.');
+    if (announceStop) {
+      void speak('Obstacle alerts stopped.');
+      if (companionRef.current) {
+        void companionSay("I've stopped for now — that's the end of this stretch of the journey.")
+          .then((reply) => speak(reply))
+          .catch(() => {});
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -259,7 +269,18 @@ export function useLidarScanner() {
       await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
       setActive(true);
       setStatus('scanning');
-      announce('Obstacle alerts started. Hold the phone upright and point it forward.');
+      if (companionRef.current) {
+        // Deterministic confirmation first, then the conversational greeting.
+        announce('Obstacle alerts started.');
+        void companionSay(
+          "I've just turned on obstacle alerts and I'm heading out — walk with me.",
+          { snapshot: snapshotRef.current },
+        )
+          .then((reply) => announce(reply))
+          .catch(() => {});
+      } else {
+        announce('Obstacle alerts started. Hold the phone upright and point it forward.');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to start LiDAR.';
       setErrorMessage(message);
@@ -273,14 +294,39 @@ export function useLidarScanner() {
     if (!active) return;
     try {
       announce('Describing scene.');
-      announce(await describeCurrentScene(snapshotRef.current), true);
+      const text = companionRef.current
+        ? await companionSay('What do you see around us right now?', {
+            snapshot: snapshotRef.current,
+            withFrame: true,
+          })
+        : await describeCurrentScene(snapshotRef.current);
+      announce(text, true);
     } catch (error) {
       announce(error instanceof Error ? error.message : 'Unable to describe the scene.');
     }
   }, [active, announce]);
 
+  const toggleCompanion = useCallback(() => {
+    const next = !companionRef.current;
+    companionRef.current = next;
+    setCompanionState(next);
+    if (next) {
+      resetCompanion();
+      announce('Companion mode on.');
+      void companionSay("Hey, I'm here — keeping you company on the way today.", {
+        snapshot: snapshotRef.current,
+      })
+        .then((reply) => announce(reply))
+        .catch(() => {});
+    } else {
+      announce('Companion mode off.');
+    }
+  }, [announce]);
+
   return {
     active,
+    companion,
+    toggleCompanion,
     describeScene,
     alert,
     errorMessage,

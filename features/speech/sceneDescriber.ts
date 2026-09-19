@@ -24,7 +24,7 @@ function compactSector(reading: SectorReading): LidarContext['left'] {
   };
 }
 
-function compactLidarContext(snapshot: ObstacleSnapshot | null): LidarContext | null {
+export function compactLidarContext(snapshot: ObstacleSnapshot | null): LidarContext | null {
   if (!snapshot) return null;
   return {
     left: compactSector(snapshot.left),

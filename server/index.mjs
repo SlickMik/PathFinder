@@ -33,6 +33,9 @@ try {
 const PORT = Number(process.env.PORT ?? 8787);
 const BASETEN_API_KEY = process.env.BASETEN_API_KEY;
 const MODEL = process.env.BASETEN_MODEL ?? 'zai-org/GLM-5.3-Flash';
+// Conversational companion model — Moonshot AI's Kimi is chatty AND accepts
+// images, so one model can both banter and see.
+const COMPANION_MODEL = process.env.BASETEN_COMPANION_MODEL ?? 'moonshotai/Kimi-K2.6';
 const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
 const BASETEN_URL = 'https://inference.baseten.co/v1/chat/completions';
 
@@ -58,6 +61,21 @@ Rules:
 - NEVER say a path, road, stairway, or crossing is "safe" or "clear to proceed". You may say a direction "appears more open" at most.
 - Do not identify people or infer sensitive personal traits (age, ethnicity, disability, etc.). "A person standing near the doorway" is enough.
 - Keep it short: 1-3 plain sentences the first time. No markdown, no lists, no preamble.`;
+
+const COMPANION_PROMPT = `You are "Path", a friendly companion walking alongside a blind or low-vision person through their everyday journey — leaving the house, walking to the car or bus stop, commuting to work, heading home. You talk like a warm, easygoing friend keeping them company, not like an assistant or a robot.
+
+Style:
+- Short, spoken-style replies: one or two natural sentences with contractions. No markdown, no lists, no emoji.
+- Acknowledge journey moments casually ("Alright, out the door — feels like a good morning for it.").
+- Remember and refer back to earlier parts of the conversation and journey.
+- If a camera frame is attached, weave what you actually see into the conversation naturally; mention hazards first.
+- Use approximate distances only when the provided LiDAR context supports them.
+
+Hard safety rules (never break these, even if asked):
+- Never say a path, road, stairway, or crossing is "safe", "clear", or "good to go". At most, a direction "looks more open".
+- Never make traffic or street-crossing decisions — gently remind them that's their call with their cane, dog, or own judgment.
+- Never identify people or guess sensitive traits (age, ethnicity, disability, etc.).
+- You are supplemental. Deterministic obstacle alerts run separately — don't repeat, downplay, or contradict them.`;
 
 // --- naive per-IP rate limiter ---------------------------------------------
 const hits = new Map();
@@ -108,6 +126,69 @@ function lidarContextText(lidar) {
     `- walking-corridor risk: ${lidar.corridorRisk ?? 'unknown'}`,
     `- tracking quality: ${lidar.tracking ?? 'unknown'}`,
   ].join('\n');
+}
+
+function sanitizeHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter(
+      (turn) =>
+        turn &&
+        (turn.role === 'user' || turn.role === 'assistant') &&
+        typeof turn.content === 'string',
+    )
+    .slice(-16)
+    .map((turn) => ({ role: turn.role, content: turn.content.slice(0, 600) }));
+}
+
+async function companionChat({ text, history, imageBase64, mimeType, lidar }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  const upstreamStart = Date.now();
+  const userContent = [
+    { type: 'text', text: `${lidarContextText(lidar)}\n\n${text}` },
+  ];
+  if (imageBase64) {
+    userContent.push({
+      type: 'image_url',
+      image_url: { url: `data:${mimeType};base64,${imageBase64}` },
+    });
+  }
+  try {
+    const response = await fetch(BASETEN_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${BASETEN_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: COMPANION_MODEL,
+        temperature: 0.7,
+        max_tokens: 160,
+        messages: [
+          { role: 'system', content: COMPANION_PROMPT },
+          ...sanitizeHistory(history),
+          { role: 'user', content: userContent },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw Object.assign(
+        new Error(`Baseten error ${response.status}: ${detail.slice(0, 300)}`),
+        { status: 502 },
+      );
+    }
+
+    const data = await response.json();
+    const reply = data.choices?.[0]?.message?.content?.trim();
+    if (!reply) throw Object.assign(new Error('Empty model response.'), { status: 502 });
+    return { reply, usage: data.usage ?? null, upstreamMs: Date.now() - upstreamStart };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function describeScene({ imageBase64, mimeType, lidar }) {
@@ -167,9 +248,9 @@ const server = http.createServer(async (req, res) => {
   const ip = req.socket.remoteAddress ?? 'unknown';
 
   if (req.method === 'GET' && req.url === '/health') {
-    return send(res, 200, { ok: true, model: MODEL });
+    return send(res, 200, { ok: true, model: MODEL, companionModel: COMPANION_MODEL });
   }
-  if (req.method !== 'POST' || req.url !== '/describe-scene') {
+  if (req.method !== 'POST' || !['/describe-scene', '/companion'].includes(req.url)) {
     return send(res, 404, { error: 'Not found.' });
   }
   if (SHARED_SECRET && req.headers['x-app-secret'] !== SHARED_SECRET) {
@@ -182,11 +263,32 @@ const server = http.createServer(async (req, res) => {
   try {
     const body = JSON.parse(await readBody(req));
     const { imageBase64, mimeType = 'image/jpeg', lidar } = body ?? {};
+    if (imageBase64 !== undefined && !['image/jpeg', 'image/png'].includes(mimeType)) {
+      return send(res, 400, { error: 'Unsupported mimeType.' });
+    }
+
+    if (req.url === '/companion') {
+      const { text, history } = body ?? {};
+      if (typeof text !== 'string' || !text.trim()) {
+        return send(res, 400, { error: 'text is required.' });
+      }
+      const { reply, usage, upstreamMs } = await companionChat({
+        text: text.slice(0, 1000),
+        history,
+        imageBase64: typeof imageBase64 === 'string' ? imageBase64 : null,
+        mimeType,
+        lidar,
+      });
+      const totalMs = Date.now() - started;
+      res.setHeader('Server-Timing', `upstream;dur=${upstreamMs}, proxy;dur=${totalMs - upstreamMs}`);
+      console.log(
+        `[companion] ok total=${totalMs}ms upstream=${upstreamMs}ms overhead=${totalMs - upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+      );
+      return send(res, 200, { reply });
+    }
+
     if (typeof imageBase64 !== 'string' || imageBase64.length < 100) {
       return send(res, 400, { error: 'imageBase64 is required.' });
-    }
-    if (!['image/jpeg', 'image/png'].includes(mimeType)) {
-      return send(res, 400, { error: 'Unsupported mimeType.' });
     }
 
     const { description, usage, upstreamMs } = await describeScene({ imageBase64, mimeType, lidar });
@@ -203,8 +305,8 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, { description });
   } catch (error) {
     const status = error?.status ?? (error?.name === 'AbortError' ? 504 : 500);
-    console.error(`[describe-scene] fail ${Date.now() - started}ms status=${status}: ${error.message}`);
-    return send(res, status, { error: 'Scene description failed.' });
+    console.error(`[${req.url}] fail ${Date.now() - started}ms status=${status}: ${error.message}`);
+    return send(res, status, { error: 'Request failed.' });
   }
 });
 
