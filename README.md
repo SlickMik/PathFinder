@@ -25,6 +25,8 @@ short-range indoor guidance.
 - Apple's on-device person segmentation fused with LiDAR distance; person evidence expires quickly
 - On-device spoken steering through the iOS speech synthesizer
 - VoiceOver-friendly controls, large Dynamic Type, and an explicit safety boundary
+- A spoken, step-by-step first-launch guide covering holding the phone, alerts, haptics,
+  route guidance, and the voice companion; replayable from the main screen at any time
 - Automatic sensor and alert shutdown when the app backgrounds or the device reaches critical heat
 
 Depth, CV, mapping, and route planning remain inside the Swift module. Only compact distances,
