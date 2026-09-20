@@ -3,7 +3,9 @@ import { RouteDebugOverlay } from '../components/RouteDebugOverlay';
 import { SectorStatus } from '../components/SectorStatus';
 import { StatusAnnouncement } from '../components/StatusAnnouncement';
 import { useLidarScanner } from '../features/scanning/useLidarScanner';
+import { hasCompletedOnboarding } from '../features/onboarding/storage';
 import { useVoiceInput } from '../features/speech/useVoiceInput';
+import { useRouter } from 'expo-router';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -28,6 +30,12 @@ const GUIDANCE_LABEL = {
 
 export default function ScannerScreen() {
   const scanner = useLidarScanner();
+  const router = useRouter();
+
+  // First launch: walk the user through the guided tour before the scanner.
+  useEffect(() => {
+    if (!hasCompletedOnboarding()) router.replace('/onboarding');
+  }, [router]);
 
   // Walk & talk: hands-free conversation loop. Listen -> user speaks ->
   // companion replies (mic closed while it talks) -> listen again.
@@ -312,6 +320,18 @@ export default function ScannerScreen() {
             </Text>
           </Pressable>
         ) : null}
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="How to use PathFinder"
+          accessibilityHint="Opens the spoken step-by-step guide."
+          onPress={() => router.push('/onboarding')}
+          style={styles.howTo}
+        >
+          <Text maxFontSizeMultiplier={1.6} style={styles.howToText}>
+            How to use PathFinder
+          </Text>
+        </Pressable>
 
         <View style={styles.safetyNote}>
           <Text maxFontSizeMultiplier={2} style={styles.safetyTitle}>
@@ -604,6 +624,20 @@ const styles = StyleSheet.create({
     color: '#C9A05E',
     fontSize: 12,
     fontWeight: '700',
+  },
+  howTo: {
+    minHeight: 56,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#3A414C',
+    backgroundColor: 'rgba(18, 23, 29, 0.86)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  howToText: {
+    color: '#DCE1E8',
+    fontSize: 17,
+    fontWeight: '800',
   },
   safetyNote: {
     borderTopWidth: 1,
