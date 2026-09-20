@@ -48,7 +48,8 @@ const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_turbo_v2_5';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe';
 const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
-const BASETEN_URL = 'https://inference.baseten.co/v1/chat/completions';
+// Overridable for local testing against a mock upstream.
+const BASETEN_URL = process.env.BASETEN_URL ?? 'https://inference.baseten.co/v1/chat/completions';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // one compressed 768px JPEG fits easily
 const UPSTREAM_TIMEOUT_MS = 25_000;
@@ -240,33 +241,88 @@ function describeRequestBody({ imageBase64, mimeType, lidar }) {
   };
 }
 
+// Retry policy per Baseten's hackathon guidance: back off exponentially (with
+// jitter) on 429 rate limits and transient 5xx/network failures, honouring a
+// Retry-After header when present, and never retrying in a tight loop.
+// Streams are only retried before the first token has been forwarded to the
+// client (a replay after that would duplicate speech). Timeouts are never
+// retried — the pedestrian is waiting.
+const MAX_UPSTREAM_RETRIES = Math.max(0, Number(process.env.BASETEN_MAX_RETRIES ?? 2));
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function retryDelayMs(attempt, retryAfterS) {
+  if (Number.isFinite(retryAfterS) && retryAfterS > 0) return Math.min(retryAfterS * 1000, 10_000);
+  const base = Math.min(500 * 2 ** attempt, 4_000); // 500ms, 1s, 2s, capped at 4s
+  return Math.round(base * (0.5 + Math.random() * 0.5)); // jitter so clients don't sync up
+}
+
+async function callBaseten(body, onDelta) {
+  const streaming = typeof onDelta === 'function';
+  let tokensSent = false;
+  const guardedDelta = streaming
+    ? (delta) => {
+        tokensSent = true;
+        onDelta(delta);
+      }
+    : null;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await callBasetenOnce(body, guardedDelta);
+    } catch (error) {
+      const transient =
+        error.upstreamStatus === 429 ||
+        (error.upstreamStatus >= 500 && error.upstreamStatus <= 599) ||
+        error.networkFailure === true;
+      if (!transient || tokensSent || attempt >= MAX_UPSTREAM_RETRIES) throw error;
+      const delay = retryDelayMs(attempt, error.retryAfterS);
+      console.warn(
+        `[baseten] ${error.upstreamStatus ?? 'network error'} — retry ${attempt + 1}/${MAX_UPSTREAM_RETRIES} in ${delay}ms`,
+      );
+      await sleep(delay);
+    }
+  }
+}
+
 // One Baseten call. When onDelta is given, streams SSE token deltas to it as
 // they arrive (Baseten supports `stream: true` on /v1/chat/completions); the
 // returned `content` is the full concatenated reply either way. onDelta lets
 // the proxy forward tokens to the client the moment they're generated, so the
 // pedestrian hears the first sentence ~1s in instead of waiting for the whole
 // reply.
-async function callBaseten(body, onDelta) {
+async function callBasetenOnce(body, onDelta) {
   const streaming = typeof onDelta === 'function';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   const upstreamStart = Date.now();
   try {
-    const response = await fetch(BASETEN_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${BASETEN_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ ...body, stream: streaming }),
-    });
+    let response;
+    try {
+      response = await fetch(BASETEN_URL, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${BASETEN_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ...body, stream: streaming }),
+      });
+    } catch (error) {
+      // Connection-level failure (DNS, reset, TLS) — retriable. Timeouts
+      // (AbortError) are not: the client has already waited long enough.
+      if (error?.name !== 'AbortError') error.networkFailure = true;
+      throw error;
+    }
 
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
       throw Object.assign(
         new Error(`Baseten error ${response.status}: ${detail.slice(0, 300)}`),
-        { status: 502 },
+        {
+          status: response.status === 429 ? 429 : 502,
+          upstreamStatus: response.status,
+          retryAfterS: Number(response.headers.get('retry-after')),
+        },
       );
     }
 
