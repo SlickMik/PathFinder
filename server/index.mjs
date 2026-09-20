@@ -312,6 +312,70 @@ async function companionChat(opts) {
   return { reply: content, usage, upstreamMs };
 }
 
+// Structured hazard extraction — GLM-5.3-Flash with a strict JSON schema so
+// the app receives machine-readable hazards, not prose.
+const HAZARD_PROMPT = `You extract pedestrian hazards from one camera frame for a blind walker.
+Report only visually confirmable physical hazards in the walking space: obstacles, people, poles, steps, curbs, vehicles, hanging or low objects. Use the LiDAR context to set proximity when it corroborates. Do not report signs, colors, or scenery. Fewer, higher-confidence hazards beat many guesses. An empty list is a valid answer.`;
+
+function hazardsRequestBody({ imageBase64, mimeType, lidar }) {
+  return {
+    model: FAST_VISION_MODEL,
+    temperature: 0,
+    max_tokens: 300,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'hazard_report',
+        strict: true,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            hazards: {
+              type: 'array',
+              maxItems: 5,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  label: { type: 'string' },
+                  direction: { type: 'string', enum: ['left', 'center', 'right'] },
+                  proximity: { type: 'string', enum: ['immediate', 'near', 'far', 'unknown'] },
+                  confidence: { type: 'string', enum: ['low', 'medium', 'high'] },
+                },
+                required: ['label', 'direction', 'proximity', 'confidence'],
+              },
+            },
+          },
+          required: ['hazards'],
+        },
+      },
+    },
+    messages: [
+      { role: 'system', content: HAZARD_PROMPT },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: lidarContextText(lidar) },
+          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+        ],
+      },
+    ],
+  };
+}
+
+async function extractHazards(opts) {
+  const { content, usage, upstreamMs } = await callBaseten(hazardsRequestBody(opts), null);
+  let hazards = [];
+  try {
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed.hazards)) hazards = parsed.hazards.slice(0, 5);
+  } catch {
+    // strict schema should prevent this; fail closed with no hazards
+  }
+  return { hazards, usage, upstreamMs };
+}
+
 async function describeScene(opts) {
   const { content, usage, upstreamMs } = await callBaseten(describeRequestBody(opts), null);
   return { description: content, usage, upstreamMs };
@@ -355,7 +419,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     return send(res, 200, { ok: true, model: MODEL, companionModel: COMPANION_MODEL });
   }
-  if (req.method !== 'POST' || !['/describe-scene', '/companion'].includes(req.url)) {
+  if (req.method !== 'POST' || !['/describe-scene', '/companion', '/hazards'].includes(req.url)) {
     return send(res, 404, { error: 'Not found.' });
   }
   if (SHARED_SECRET && req.headers['x-app-secret'] !== SHARED_SECRET) {
@@ -399,6 +463,16 @@ const server = http.createServer(async (req, res) => {
 
     if (typeof imageBase64 !== 'string' || imageBase64.length < 100) {
       return send(res, 400, { error: 'imageBase64 is required.' });
+    }
+
+    if (req.url === '/hazards') {
+      const { hazards, usage, upstreamMs } = await extractHazards({ imageBase64, mimeType, lidar });
+      const totalMs = Date.now() - started;
+      res.setHeader('Server-Timing', `upstream;dur=${upstreamMs}, proxy;dur=${totalMs - upstreamMs}`);
+      console.log(
+        `[hazards] ok total=${totalMs}ms upstream=${upstreamMs}ms count=${hazards.length} tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+      );
+      return send(res, 200, { hazards });
     }
 
     if (body.stream) {

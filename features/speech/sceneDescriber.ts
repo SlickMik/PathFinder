@@ -50,6 +50,49 @@ export function compactLidarContext(snapshot: ObstacleSnapshot | null): LidarCon
   };
 }
 
+export type SceneHazard = {
+  label: string;
+  direction: 'left' | 'center' | 'right';
+  proximity: 'immediate' | 'near' | 'far' | 'unknown';
+  confidence: 'low' | 'medium' | 'high';
+};
+
+const HAZARDS_URL = SCENE_URL?.replace('/describe-scene', '/hazards');
+
+// Structured hazard extraction (Baseten structured outputs, GLM-5.3-Flash).
+// Fired in parallel with the spoken description using the same frame — never
+// blocks or delays speech.
+async function fetchHazards(
+  imageBase64: string,
+  snapshot: ObstacleSnapshot | null,
+): Promise<SceneHazard[]> {
+  if (!HAZARDS_URL) return [];
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(HAZARDS_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(APP_SECRET ? { 'x-app-secret': APP_SECRET } : {}),
+      },
+      body: JSON.stringify({
+        imageBase64,
+        mimeType: 'image/jpeg',
+        lidar: compactLidarContext(snapshot),
+      }),
+    });
+    if (!response.ok) return [];
+    const { hazards } = (await response.json()) as { hazards?: SceneHazard[] };
+    return Array.isArray(hazards) ? hazards : [];
+  } catch {
+    return []; // hazards are supplementary — fail silent, never block speech
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 let inFlight: Promise<string> | null = null;
 
 // Grabs the current ARKit camera frame and posts it, with compact LiDAR
@@ -64,6 +107,17 @@ export function describeCurrentScene(
     inFlight = null;
   });
   return inFlight;
+}
+
+// Captures a fresh frame and returns structured hazards. Runs in parallel
+// with whatever speech is happening — never blocks it.
+export async function fetchSceneHazards(
+  snapshot: ObstacleSnapshot | null,
+): Promise<SceneHazard[]> {
+  const frame = await ExpoLidarVision.captureFrame(512, 0.5);
+  const hazards = await fetchHazards(frame.base64, snapshot);
+  console.log(`[hazards] received ${hazards.length}`);
+  return hazards;
 }
 
 async function requestDescription(

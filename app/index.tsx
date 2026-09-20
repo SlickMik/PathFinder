@@ -223,6 +223,30 @@ export default function ScannerScreen() {
           </Text>
         </Pressable>
 
+        {scanner.sceneHazards.length > 0 ? (
+          <View
+            accessible
+            accessibilityLabel={`Detected hazards: ${scanner.sceneHazards
+              .map((h) => `${h.label}, ${h.direction}, ${h.proximity}`)
+              .join('. ')}`}
+            style={styles.hazards}
+          >
+            <Text maxFontSizeMultiplier={1.5} style={styles.hazardsTitle}>
+              DETECTED HAZARDS · STRUCTURED
+            </Text>
+            {scanner.sceneHazards.map((hazard, index) => (
+              <View key={`${hazard.label}-${index}`} style={styles.hazardRow}>
+                <Text maxFontSizeMultiplier={1.5} style={styles.hazardLabel}>
+                  {hazard.label}
+                </Text>
+                <Text maxFontSizeMultiplier={1.5} style={styles.hazardMeta}>
+                  {hazard.direction.toUpperCase()} · {hazard.proximity} · {hazard.confidence}
+                </Text>
+              </View>
+            ))}
+          </View>
+        ) : null}
+
         <Pressable
           accessibilityRole="button"
           accessibilityState={{ selected: scanner.alertVoice }}
@@ -546,6 +570,38 @@ const styles = StyleSheet.create({
     color: '#F2FF63',
     fontSize: 18,
     fontWeight: '800',
+  },
+  hazards: {
+    borderRadius: 16,
+    backgroundColor: '#1C1710',
+    borderWidth: 1,
+    borderColor: '#7A5A24',
+    padding: 14,
+    gap: 8,
+  },
+  hazardsTitle: {
+    color: '#F0B54A',
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+  },
+  hazardRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    gap: 8,
+  },
+  hazardLabel: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '700',
+    flexShrink: 1,
+  },
+  hazardMeta: {
+    color: '#C9A05E',
+    fontSize: 12,
+    fontWeight: '700',
   },
   safetyNote: {
     borderTopWidth: 1,

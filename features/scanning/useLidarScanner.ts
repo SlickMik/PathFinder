@@ -5,7 +5,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
 import { companionSay, resetCompanion } from '../speech/companion';
-import { describeCurrentScene } from '../speech/sceneDescriber';
+import { describeCurrentScene, fetchSceneHazards } from '../speech/sceneDescriber';
+import type { SceneHazard } from '../speech/sceneDescriber';
 import { speak, speakStream, stopSpeaking } from '../speech/speech';
 import { emitRiskHaptic, hapticIntervalMs } from './haptics';
 import { safetyEnvelopeForSpeed } from './motionSafety';
@@ -64,6 +65,14 @@ export function useLidarScanner() {
   // Rolling log of journey moments (guidance/risk changes) so the companion
   // can reference what just happened on the walk.
   const journeyEventsRef = useRef<Array<{ at: number; event: string }>>([]);
+  const [sceneHazards, setSceneHazards] = useState<SceneHazard[]>([]);
+  // Journey stats for the end-of-walk debrief.
+  const journeyStatsRef = useRef({
+    startedAt: null as number | null,
+    nearCount: 0,
+    criticalCount: 0,
+    guidanceChanges: 0,
+  });
 
   const logJourneyEvent = useCallback((event: string) => {
     const events = journeyEventsRef.current;
@@ -154,6 +163,8 @@ export function useLidarScanner() {
       );
       if (nextAlert.risk !== alertRef.current.risk) {
         logJourneyEvent(`obstacle risk went from ${alertRef.current.risk} to ${nextAlert.risk}`);
+        if (nextAlert.risk === 'near') journeyStatsRef.current.nearCount += 1;
+        if (nextAlert.risk === 'critical') journeyStatsRef.current.criticalCount += 1;
       }
       alertRef.current = nextAlert;
       setAlert(nextAlert);
@@ -172,6 +183,7 @@ export function useLidarScanner() {
         nextGuidance.instruction !== 'hold'
       ) {
         logJourneyEvent(`guidance changed to "${nextGuidance.instruction}" (${nextGuidance.source})`);
+        journeyStatsRef.current.guidanceChanges += 1;
       }
 
       const viewValid =
@@ -240,8 +252,24 @@ export function useLidarScanner() {
     if (announceStop) {
       void speak('Obstacle alerts stopped.');
       if (companionRef.current) {
+        // Journey debrief — async, no latency budget. Kimi gets the walk's
+        // stats and recent events and closes out the journey warmly.
+        const stats = journeyStatsRef.current;
+        const durationS = stats.startedAt
+          ? Math.round((Date.now() - stats.startedAt) / 1000)
+          : 0;
+        const now = Date.now();
+        const recentEvents = journeyEventsRef.current.map(
+          (entry) => `${Math.round((now - entry.at) / 1000)}s ago: ${entry.event}`,
+        );
+        const debriefPrompt =
+          `The walk just ended. Give me a short, warm end-of-journey debrief (2-3 sentences). ` +
+          `Stats: duration ${Math.floor(durationS / 60)}m ${durationS % 60}s, ` +
+          `close-call moments: ${stats.nearCount}, critical stops: ${stats.criticalCount}, ` +
+          `direction changes: ${stats.guidanceChanges}.`;
         const speech = speakStream();
-        void companionSay("I've stopped for now — that's the end of this stretch of the journey.", {
+        void companionSay(debriefPrompt, {
+          events: recentEvents,
           onDelta: (delta) => speech.push(delta),
         })
           .then(() => speech.done())
@@ -329,6 +357,14 @@ export function useLidarScanner() {
 
       await ExpoLidarVision.start(DEFAULT_LIDAR_OPTIONS);
       await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
+      journeyStatsRef.current = {
+        startedAt: Date.now(),
+        nearCount: 0,
+        criticalCount: 0,
+        guidanceChanges: 0,
+      };
+      journeyEventsRef.current = [];
+      setSceneHazards([]);
       setActive(true);
       setStatus('scanning');
       if (companionRef.current) {
@@ -357,6 +393,11 @@ export function useLidarScanner() {
     if (!active) return;
     try {
       announce('Describing scene.');
+      // Structured hazards (Baseten structured outputs) in parallel — lands in
+      // the UI whenever ready, never delays the spoken description.
+      void fetchSceneHazards(snapshotRef.current)
+        .then(setSceneHazards)
+        .catch(() => {});
       // Stream the description so the first sentence is spoken as soon as the
       // model produces it, instead of after the whole reply returns. Guard
       // against critical alerts: this is the longest reply (max 160 tokens) and
@@ -440,6 +481,7 @@ export function useLidarScanner() {
   return {
     active,
     alertVoice,
+    sceneHazards,
     toggleAlertVoice,
     askCompanion,
     companion,
