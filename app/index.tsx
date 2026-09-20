@@ -5,7 +5,7 @@ import { StatusAnnouncement } from '../components/StatusAnnouncement';
 import { useLidarScanner } from '../features/scanning/useLidarScanner';
 import { useVoiceInput } from '../features/speech/useVoiceInput';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 const RISK_LABEL = {
@@ -56,7 +56,9 @@ export default function ScannerScreen() {
       },
     },
   );
-  voiceRef.current = voice;
+  useEffect(() => {
+    voiceRef.current = voice;
+  }, [voice]);
 
   const toggleWalkTalk = useCallback(() => {
     const next = !walkTalkRef.current;

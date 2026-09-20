@@ -43,7 +43,9 @@ const FAST_VISION_MODEL = process.env.BASETEN_FAST_VISION_MODEL ?? 'zai-org/GLM-
 // ElevenLabs: natural voice out. OpenAI: understands the user's raw audio
 // (better than on-device STT in noise/accents); the reply brain stays Baseten.
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? '21m00Tcm4TlvDq8ikWAM'; // Rachel
+// Sarah is a current premade voice available to free-tier API accounts; the
+// former Rachel library voice now returns `paid_plan_required` for those keys.
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? 'EXAVITQu4vr4xnSDxMaL';
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_turbo_v2_5';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe';

@@ -418,6 +418,28 @@ export function useLidarScanner() {
       announce(error instanceof Error ? error.message : 'Unable to describe the scene.');
     }
   }, [active, announce]);
+  const tryUnderstandAudio = useCallback(
+    async (audioUri: string, recentEvents: string[]) => {
+      try {
+        const audioBase64 = await readAsStringAsync(audioUri, { encoding: 'base64' });
+        const extension = audioUri.split('.').pop()?.toLowerCase() ?? 'caf';
+        const audioMime =
+          extension === 'wav' ? 'audio/wav' : extension === 'caf' ? 'audio/x-caf' : 'audio/m4a';
+        return await understandAudio(audioBase64, audioMime, {
+          snapshot: snapshotRef.current,
+          alert: alertRef.current,
+          guidance: guidanceRef.current,
+          events: recentEvents,
+          withFrame: active,
+        });
+      } catch (error) {
+        console.warn('[companion] audio read failed, using local transcript:', error);
+        return null;
+      }
+    },
+    [active],
+  );
+
   const askCompanion = useCallback(
     async (text: string, audioUri: string | null = null) => {
       console.log(`[companion] user said: "${text}"`);
@@ -465,29 +487,7 @@ export function useLidarScanner() {
         announce('Companion is unavailable right now.');
       }
     },
-    [active, announce],
-  );
-
-  const tryUnderstandAudio = useCallback(
-    async (audioUri: string, recentEvents: string[]) => {
-      try {
-        const audioBase64 = await readAsStringAsync(audioUri, { encoding: 'base64' });
-        const extension = audioUri.split('.').pop()?.toLowerCase() ?? 'caf';
-        const audioMime =
-          extension === 'wav' ? 'audio/wav' : extension === 'caf' ? 'audio/x-caf' : 'audio/m4a';
-        return await understandAudio(audioBase64, audioMime, {
-          snapshot: snapshotRef.current,
-          alert: alertRef.current,
-          guidance: guidanceRef.current,
-          events: recentEvents,
-          withFrame: active,
-        });
-      } catch (error) {
-        console.warn('[companion] audio read failed, using local transcript:', error);
-        return null;
-      }
-    },
-    [active],
+    [active, announce, tryUnderstandAudio],
   );
 
   const toggleAlertVoice = useCallback(() => {
