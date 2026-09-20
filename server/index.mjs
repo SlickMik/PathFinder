@@ -49,6 +49,16 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? 'EXAVITQu4vr4xnSD
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_turbo_v2_5';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe';
+// Gemini: alternate brain (OpenAI-compatible endpoint) AND native multimodal
+// ears — hears raw audio + sees the frame + reads LiDAR context in ONE call.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || null;
+const GEMINI_MODEL = process.env.GEMINI_MODEL ?? 'gemini-3.6-flash';
+const GEMINI_OPENAI_URL =
+  'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+const GEMINI_NATIVE_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+// 'baseten' (default) or 'gemini'. Auto-fails-over to gemini if the Baseten
+// key is rejected, so the assistant never loses its brain.
+let brainProvider = process.env.BRAIN_PROVIDER ?? 'baseten';
 const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
 // Overridable for local testing against a mock upstream.
 const BASETEN_URL = process.env.BASETEN_URL ?? 'https://inference.baseten.co/v1/chat/completions';
@@ -273,6 +283,20 @@ async function callBaseten(body, onDelta) {
     try {
       return await callBasetenOnce(body, guardedDelta);
     } catch (error) {
+      // Invalid/revoked Baseten key: fail over to Gemini for the rest of the
+      // process so the assistant keeps its brain, and retry immediately.
+      if (
+        (error.upstreamStatus === 401 || error.upstreamStatus === 403) &&
+        brainProvider === 'baseten' &&
+        GEMINI_API_KEY &&
+        !tokensSent
+      ) {
+        console.warn(
+          `[brain] Baseten key rejected (${error.upstreamStatus}) — FAILING OVER to Gemini (${GEMINI_MODEL})`,
+        );
+        brainProvider = 'gemini';
+        continue;
+      }
       const transient =
         error.upstreamStatus === 429 ||
         (error.upstreamStatus >= 500 && error.upstreamStatus <= 599) ||
@@ -298,17 +322,26 @@ async function callBasetenOnce(body, onDelta) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   const upstreamStart = Date.now();
+  // Brain provider selection: Baseten by default, Gemini when failed-over or
+  // forced via BRAIN_PROVIDER=gemini. Gemini's OpenAI-compatible endpoint
+  // accepts the exact same request shape — only URL, key, and model change.
+  const useGemini = brainProvider === 'gemini' && GEMINI_API_KEY;
+  const url = useGemini ? GEMINI_OPENAI_URL : BASETEN_URL;
+  const apiKey = useGemini ? GEMINI_API_KEY : BASETEN_API_KEY;
+  const outgoing = useGemini
+    ? { ...body, model: GEMINI_MODEL, reasoning_effort: 'none' }
+    : body;
   try {
     let response;
     try {
-      response = await fetch(BASETEN_URL, {
+      response = await fetch(url, {
         method: 'POST',
         signal: controller.signal,
         headers: {
-          Authorization: `Bearer ${BASETEN_API_KEY}`,
+          Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ ...body, stream: streaming }),
+        body: JSON.stringify({ ...outgoing, stream: streaming }),
       });
     } catch (error) {
       // Connection-level failure (DNS, reset, TLS) — retriable. Timeouts
@@ -457,9 +490,78 @@ async function streamTts(res, text) {
 }
 
 // --- OpenAI ears: transcribe the user's raw audio ---------------------------
+// Gemini native multimodal understanding: ONE call takes the user's raw
+// audio + the camera frame + LiDAR/journey context and returns both the
+// transcript and the companion's reply — ears and brain fused.
+async function geminiUnderstand({ audioBase64, audioMime, imageBase64, mimeType, lidar, events, history }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  const upstreamStart = Date.now();
+  const historyText = sanitizeHistory(history)
+    .map((turn) => `${turn.role === 'user' ? 'Them' : 'You'}: ${turn.content}`)
+    .join('\n');
+  const eventsText =
+    Array.isArray(events) && events.length > 0
+      ? `\nRecent journey moments:\n${events.slice(-6).map((event) => `- ${String(event).slice(0, 120)}`).join('\n')}`
+      : '';
+  const parts = [
+    {
+      text: `${COMPANION_PROMPT}\n\n${lidarContextText(lidar)}${eventsText}${historyText ? `\n\nConversation so far:\n${historyText}` : ''}\n\nThe attached audio is what they just said to you. ${imageBase64 ? 'The attached photo is what the camera sees right now. ' : ''}Return JSON with "transcript" (their exact words) and "reply" (what you say back, following all style and safety rules).`,
+    },
+    { inline_data: { mime_type: audioMime, data: audioBase64 } },
+  ];
+  if (imageBase64) parts.push({ inline_data: { mime_type: mimeType, data: imageBase64 } });
+  try {
+    const response = await fetch(GEMINI_NATIVE_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts }],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 500,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'OBJECT',
+            properties: { transcript: { type: 'STRING' }, reply: { type: 'STRING' } },
+            required: ['transcript', 'reply'],
+          },
+        },
+      }),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw Object.assign(new Error(`Gemini ${response.status}: ${detail.slice(0, 300)}`), {
+        status: 502,
+      });
+    }
+    const data = await response.json();
+    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const parsed = JSON.parse(raw ?? '{}');
+    if (!parsed.transcript || !parsed.reply) {
+      throw Object.assign(new Error('Incomplete Gemini understand response.'), { status: 502 });
+    }
+    return {
+      transcript: String(parsed.transcript),
+      reply: String(parsed.reply),
+      usage: data.usageMetadata ?? null,
+      upstreamMs: Date.now() - upstreamStart,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function transcribeAudio(audioBase64, audioMime) {
   const form = new FormData();
-  const ext = audioMime.includes('wav') ? 'wav' : audioMime.includes('caf') ? 'caf' : 'm4a';
+  const ext = audioMime.includes('wav')
+    ? 'wav'
+    : audioMime.includes('caf')
+      ? 'caf'
+      : audioMime.includes('mpeg') || audioMime.includes('mp3')
+        ? 'mp3'
+        : 'm4a';
   form.append(
     'file',
     new Blob([Buffer.from(audioBase64, 'base64')], { type: audioMime }),
@@ -556,7 +658,8 @@ const server = http.createServer(async (req, res) => {
       model: MODEL,
       companionModel: COMPANION_MODEL,
       tts: Boolean(ELEVENLABS_API_KEY),
-      understand: Boolean(OPENAI_API_KEY),
+      understand: Boolean(GEMINI_API_KEY || OPENAI_API_KEY),
+      brain: brainProvider === 'gemini' && GEMINI_API_KEY ? `gemini (${GEMINI_MODEL})` : 'baseten',
     });
   }
   if (req.method === 'GET' && req.url?.startsWith('/tts?')) {
@@ -600,11 +703,32 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.url === '/understand') {
-      if (!OPENAI_API_KEY) return send(res, 503, { error: 'Understand not configured.' });
+      if (!GEMINI_API_KEY && !OPENAI_API_KEY) {
+        return send(res, 503, { error: 'Understand not configured.' });
+      }
       const { audioBase64, audioMime = 'audio/m4a', history, events } = body ?? {};
       if (typeof audioBase64 !== 'string' || audioBase64.length < 100) {
         return send(res, 400, { error: 'audioBase64 is required.' });
       }
+
+      // Preferred: Gemini hears + sees + replies in a single multimodal call.
+      if (GEMINI_API_KEY) {
+        const { transcript, reply, usage, upstreamMs } = await geminiUnderstand({
+          audioBase64,
+          audioMime,
+          imageBase64: typeof imageBase64 === 'string' ? imageBase64 : null,
+          mimeType,
+          lidar,
+          events,
+          history,
+        });
+        const totalMs = Date.now() - started;
+        console.log(
+          `[understand] ok (gemini one-shot) total=${totalMs}ms upstream=${upstreamMs}ms tokens=${usage?.promptTokenCount ?? '?'}/${usage?.candidatesTokenCount ?? '?'}`,
+        );
+        return send(res, 200, { transcript, reply });
+      }
+
       const transcript = await transcribeAudio(audioBase64, audioMime);
       console.log(`[understand] transcript (${transcript.length} chars) via ${OPENAI_TRANSCRIBE_MODEL}`);
       const { reply, usage, upstreamMs } = await companionChat({
