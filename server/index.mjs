@@ -175,12 +175,19 @@ function sanitizeHistory(history) {
     .map((turn) => ({ role: turn.role, content: turn.content.slice(0, 600) }));
 }
 
-async function companionChat({ text, history, imageBase64, mimeType, lidar }) {
+async function companionChat({ text, history, events, imageBase64, mimeType, lidar }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   const upstreamStart = Date.now();
+  const eventsText =
+    Array.isArray(events) && events.length > 0
+      ? `\nRecent journey moments (you may reference these naturally):\n${events
+          .slice(-6)
+          .map((event) => `- ${String(event).slice(0, 120)}`)
+          .join('\n')}`
+      : '';
   const userContent = [
-    { type: 'text', text: `${lidarContextText(lidar)}\n\n${text}` },
+    { type: 'text', text: `${lidarContextText(lidar)}${eventsText}\n\n${text}` },
   ];
   if (imageBase64) {
     userContent.push({
@@ -304,13 +311,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.url === '/companion') {
-      const { text, history } = body ?? {};
+      const { text, history, events } = body ?? {};
       if (typeof text !== 'string' || !text.trim()) {
         return send(res, 400, { error: 'text is required.' });
       }
       const { reply, usage, upstreamMs } = await companionChat({
         text: text.slice(0, 1000),
         history,
+        events,
         imageBase64: typeof imageBase64 === 'string' ? imageBase64 : null,
         mimeType,
         lidar,

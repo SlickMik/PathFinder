@@ -52,6 +52,15 @@ export function useLidarScanner() {
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({ instruction: 'hold', timestamp: 0 });
   const lastAlertSpeechRef = useRef({ text: '', timestamp: 0 });
+  // Rolling log of journey moments (guidance/risk changes) so the companion
+  // can reference what just happened on the walk.
+  const journeyEventsRef = useRef<Array<{ at: number; event: string }>>([]);
+
+  const logJourneyEvent = useCallback((event: string) => {
+    const events = journeyEventsRef.current;
+    events.push({ at: Date.now(), event });
+    if (events.length > 8) events.shift();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -121,6 +130,9 @@ export function useLidarScanner() {
         nextSnapshot,
         nextSafetyEnvelope,
       );
+      if (nextAlert.risk !== alertRef.current.risk) {
+        logJourneyEvent(`obstacle risk went from ${alertRef.current.risk} to ${nextAlert.risk}`);
+      }
       alertRef.current = nextAlert;
       setAlert(nextAlert);
 
@@ -132,6 +144,13 @@ export function useLidarScanner() {
       guidanceRef.current = nextGuidance;
       setGuidance(nextGuidance);
       speakGuidance(nextGuidance, previousGuidance);
+
+      if (
+        nextGuidance.instruction !== previousGuidance.instruction &&
+        nextGuidance.instruction !== 'hold'
+      ) {
+        logJourneyEvent(`guidance changed to "${nextGuidance.instruction}" (${nextGuidance.source})`);
+      }
 
       const viewValid =
         nextSnapshot.tracking === 'normal' && nextSnapshot.deviceAim === 'forward';
@@ -326,15 +345,22 @@ export function useLidarScanner() {
       try {
         // The user spoke — cut off any ongoing narration immediately.
         await stopSpeaking();
-        const wantsToSee = /\b(see|look|front|around|ahead|describe|view)\b/i.test(text);
+        const now = Date.now();
+        const recentEvents = journeyEventsRef.current
+          .filter((entry) => now - entry.at < 90_000)
+          .map((entry) => `${Math.round((now - entry.at) / 1000)}s ago: ${entry.event}`);
         const reply = await companionSay(text, {
           snapshot: snapshotRef.current,
           alert: alertRef.current,
           guidance: guidanceRef.current,
-          withFrame: wantsToSee && active,
+          events: recentEvents,
+          // Walking companion: every voice turn gets fresh eyes while scanning.
+          withFrame: active,
         });
         console.log(`[companion] reply: "${reply}"`);
-        announce(reply, true);
+        // Await the spoken reply so hands-free mode can reopen the mic
+        // only after the companion finishes talking (no self-echo).
+        await speak(reply, true);
       } catch (error) {
         console.warn('[companion] request failed:', error);
         announce('Companion is unavailable right now.');

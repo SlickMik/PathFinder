@@ -5,6 +5,7 @@ import { StatusAnnouncement } from '../components/StatusAnnouncement';
 import { useLidarScanner } from '../features/scanning/useLidarScanner';
 import { useVoiceInput } from '../features/speech/useVoiceInput';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useRef, useState } from 'react';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 const RISK_LABEL = {
@@ -27,7 +28,42 @@ const GUIDANCE_LABEL = {
 
 export default function ScannerScreen() {
   const scanner = useLidarScanner();
-  const voice = useVoiceInput((text) => void scanner.askCompanion(text));
+
+  // Walk & talk: hands-free conversation loop. Listen -> user speaks ->
+  // companion replies (mic closed while it talks) -> listen again.
+  const [walkTalk, setWalkTalk] = useState(false);
+  const walkTalkRef = useRef(false);
+  const voiceRef = useRef<{ start: () => Promise<void> } | null>(null);
+
+  const resumeListening = useCallback((delayMs: number) => {
+    if (!walkTalkRef.current) return;
+    setTimeout(() => {
+      if (walkTalkRef.current) void voiceRef.current?.start();
+    }, delayMs);
+  }, []);
+
+  const voice = useVoiceInput(
+    (text) => {
+      void (async () => {
+        await scanner.askCompanion(text); // resolves after the reply is spoken
+        resumeListening(350);
+      })();
+    },
+    {
+      // Silence or recognition hiccup: quietly reopen the mic.
+      onEnd: (gotText) => {
+        if (!gotText) resumeListening(600);
+      },
+    },
+  );
+  voiceRef.current = voice;
+
+  const toggleWalkTalk = useCallback(() => {
+    const next = !walkTalkRef.current;
+    walkTalkRef.current = next;
+    setWalkTalk(next);
+    if (next) void voiceRef.current?.start();
+  }, []);
   const visibleRisk = scanner.active ? scanner.alert.risk : 'unknown';
   const riskLabel = RISK_LABEL[visibleRisk];
   const riskDetail =
@@ -205,14 +241,33 @@ export default function ScannerScreen() {
         {scanner.companion ? (
           <Pressable
             accessibilityRole="button"
+            accessibilityState={{ selected: walkTalk }}
+            accessibilityLabel={walkTalk ? 'Stop walk and talk' : 'Start walk and talk'}
+            accessibilityHint="Hands-free conversation for the whole journey. The companion listens, answers, then listens again."
+            onPress={toggleWalkTalk}
+            style={[styles.talk, walkTalk && styles.talkActive]}
+          >
+            <Text maxFontSizeMultiplier={1.6} style={styles.talkText}>
+              {walkTalk
+                ? voice.listening
+                  ? 'Listening… (tap to stop)'
+                  : 'Walk & talk: on (tap to stop)'
+                : 'Walk & talk: start conversation'}
+            </Text>
+          </Pressable>
+        ) : null}
+
+        {scanner.companion && !walkTalk ? (
+          <Pressable
+            accessibilityRole="button"
             accessibilityLabel="Hold to talk"
             accessibilityHint="Hold down, speak your question, then release to send it."
             onPressIn={() => void voice.start()}
             onPressOut={() => voice.stop()}
-            style={[styles.talk, voice.listening && styles.talkActive]}
+            style={[styles.describe, voice.listening && styles.talkActive]}
           >
-            <Text maxFontSizeMultiplier={1.6} style={styles.talkText}>
-              {voice.listening ? 'Listening… release to send' : 'Hold to talk'}
+            <Text maxFontSizeMultiplier={1.6} style={styles.describeText}>
+              {voice.listening ? 'Listening… release to send' : 'Hold to talk (single question)'}
             </Text>
           </Pressable>
         ) : null}

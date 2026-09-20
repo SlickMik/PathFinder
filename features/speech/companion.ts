@@ -26,6 +26,7 @@ type CompanionOptions = {
   snapshot?: ObstacleSnapshot | null;
   alert?: AlertState | null;
   guidance?: NavigationGuidance | null;
+  events?: string[];
   withFrame?: boolean;
 };
 
@@ -40,7 +41,7 @@ export function companionSay(text: string, options: CompanionOptions = {}): Prom
 
 async function requestReply(
   text: string,
-  { snapshot = null, alert = null, guidance = null, withFrame = false }: CompanionOptions,
+  { snapshot = null, alert = null, guidance = null, events = [], withFrame = false }: CompanionOptions,
 ): Promise<string> {
   if (!COMPANION_URL) throw new Error('Companion backend is not configured.');
   console.log(`[companion] POST ${COMPANION_URL} (frame=${withFrame})`);
@@ -61,6 +62,7 @@ async function requestReply(
       body: JSON.stringify({
         text,
         history,
+        events: events.slice(-6),
         lidar: {
           ...(compactLidarContext(snapshot) ?? {}),
           alert: alert ? { risk: alert.risk, direction: alert.direction } : null,

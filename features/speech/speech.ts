@@ -49,16 +49,25 @@ async function resolveVoice(): Promise<string | null> {
   }
 }
 
-export async function speak(text: string, critical = false): Promise<void> {
-  await ensureAudioMode();
-  if (preferredVoice === undefined) preferredVoice = await resolveVoice();
-  // Critical alerts cut off whatever is being read; others queue behind it.
-  if (critical) await Speech.stop();
-  Speech.speak(text, {
-    rate: critical ? 1.05 : 0.98,
-    pitch: 1.0,
-    language: 'en-US',
-    ...(preferredVoice ? { voice: preferredVoice } : {}),
+// Resolves when the utterance finishes (or is stopped) — lets callers wait
+// for speech to end before reopening the microphone.
+export function speak(text: string, critical = false): Promise<void> {
+  return new Promise((resolve) => {
+    void (async () => {
+      await ensureAudioMode();
+      if (preferredVoice === undefined) preferredVoice = await resolveVoice();
+      // Critical alerts cut off whatever is being read; others queue behind it.
+      if (critical) await Speech.stop();
+      Speech.speak(text, {
+        rate: critical ? 1.05 : 0.98,
+        pitch: 1.0,
+        language: 'en-US',
+        ...(preferredVoice ? { voice: preferredVoice } : {}),
+        onDone: () => resolve(),
+        onStopped: () => resolve(),
+        onError: () => resolve(),
+      });
+    })();
   });
 }
 

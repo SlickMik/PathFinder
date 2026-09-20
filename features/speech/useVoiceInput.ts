@@ -7,14 +7,26 @@ import { reapplyAudioMode } from './speech';
 
 // Push-to-talk voice input: hold to record, release to send the final
 // transcript. On-device iOS speech recognition — audio is not uploaded.
-export function useVoiceInput(onTranscript: (text: string) => void) {
+type VoiceInputOptions = {
+  // Called when recognition ends; gotText=false means silence/no speech.
+  onEnd?: (gotText: boolean) => void;
+};
+
+export function useVoiceInput(
+  onTranscript: (text: string) => void,
+  options: VoiceInputOptions = {},
+) {
   const [listening, setListening] = useState(false);
+  const listeningRef = useRef(false);
   const transcriptRef = useRef('');
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
+  const onEndRef = useRef(options.onEnd);
+  onEndRef.current = options.onEnd;
 
   useSpeechRecognitionEvent('start', () => {
     console.log('[voice] recognition started');
+    listeningRef.current = true;
     setListening(true);
   });
 
@@ -27,22 +39,27 @@ export function useVoiceInput(onTranscript: (text: string) => void) {
   useSpeechRecognitionEvent('end', () => {
     const text = transcriptRef.current.trim();
     console.log(`[voice] recognition ended, transcript: "${text}"`);
+    listeningRef.current = false;
     setListening(false);
     transcriptRef.current = '';
     // Recognition switched the audio session to record mode — restore
     // playback mode or replies may go quiet / route to the earpiece.
     void reapplyAudioMode();
     if (text) onTranscriptRef.current(text);
+    onEndRef.current?.(Boolean(text));
   });
 
   useSpeechRecognitionEvent('error', (event) => {
     console.warn(`[voice] error: ${event.error} — ${event.message}`);
+    listeningRef.current = false;
     setListening(false);
     transcriptRef.current = '';
     void reapplyAudioMode();
+    onEndRef.current?.(false);
   });
 
   const start = useCallback(async () => {
+    if (listeningRef.current) return;
     try {
       const permissions = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
       console.log(
