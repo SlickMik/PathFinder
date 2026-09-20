@@ -3,6 +3,14 @@ export type Risk = 'clear' | 'caution' | 'near' | 'critical' | 'unknown';
 export type Sector = 'left' | 'center' | 'right';
 export type Tracking = 'normal' | 'limited' | 'unavailable';
 export type DeviceAim = 'forward' | 'too-high' | 'too-low' | 'unstable';
+export type WalkableSurface =
+  | 'terrain'
+  | 'curb-cut'
+  | 'sidewalk'
+  | 'plain-crosswalk'
+  | 'zebra-crosswalk'
+  | 'covering'
+  | 'doorway-opening';
 export type NavigationInstruction =
   | 'hold'
   | 'stop'
@@ -49,17 +57,23 @@ export type ObstacleSnapshot = {
     isNarrowOpening: boolean;
     /** Whether the native path was constrained by semantic walkable-surface evidence. */
     source?: 'segmented-path' | 'lidar-route';
-    surfaceClass?:
-      | 'terrain'
-      | 'curb-cut'
-      | 'sidewalk'
-      | 'plain-crosswalk'
-      | 'zebra-crosswalk'
-      | 'covering'
-      | null;
+    surfaceClass?: WalkableSurface | null;
     goalDistanceM?: number;
+    /** Mobilio-style smoothed semantic heading before LiDAR/A* safety fusion. */
+    semanticHeadingDeg?: number | null;
+    semanticPathLengthM?: number | null;
+    /** Side openings detected along the accepted semantic path. */
+    branches?: Array<{
+      direction: 'left' | 'right';
+      distanceM: number;
+    }>;
     /** Shortest observed path in metres, relative to the phone. */
     path?: Array<{
+      lateralM: number;
+      forwardM: number;
+    }>;
+    /** Nearby LiDAR or semantic boundary cells, relative to the phone. */
+    obstacles?: Array<{
       lateralM: number;
       forwardM: number;
     }>;
@@ -82,6 +96,7 @@ export type NavigationGuidance = {
   clearanceM: number | null;
   openingWidthM: number | null;
   isNarrowOpening: boolean;
+  surfaceClass: WalkableSurface | null;
   source: 'segmented-path' | 'lidar-route' | 'reactive-sectors' | 'none';
   pendingInstruction: NavigationInstruction | null;
   pendingFrameCount: number;
@@ -127,6 +142,8 @@ export type CapturedFrame = {
 
 export type DebugFramePayload = CapturedFrame & {
   segmentationAvailable: boolean;
+  pathSegmentationAvailable: boolean;
+  floorDepthAvailable?: boolean;
   personDetected: boolean;
 };
 

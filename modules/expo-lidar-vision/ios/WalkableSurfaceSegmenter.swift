@@ -1,6 +1,7 @@
 import ARKit
 import CoreML
 import CoreVideo
+import Foundation
 import ImageIO
 import Vision
 
@@ -14,6 +15,7 @@ enum WalkableSurfaceClass: UInt8 {
   case plainCrosswalk = 6
   case zebraCrosswalk = 7
   case covering = 8
+  case doorwayOpening = 9
 
   var name: String {
     switch self {
@@ -26,6 +28,7 @@ enum WalkableSurfaceClass: UInt8 {
     case .plainCrosswalk: return "plain-crosswalk"
     case .zebraCrosswalk: return "zebra-crosswalk"
     case .covering: return "covering"
+    case .doorwayOpening: return "doorway-opening"
     }
   }
 
@@ -34,27 +37,44 @@ enum WalkableSurfaceClass: UInt8 {
   /// unless a future navigation state explicitly authorizes a road crossing.
   var traversability: Float? {
     switch self {
-    case .sidewalk, .curbCut, .plainCrosswalk, .zebraCrosswalk, .covering:
+    case .sidewalk, .curbCut, .plainCrosswalk, .zebraCrosswalk, .covering, .doorwayOpening:
       return 1
-    case .terrain:
-      return 0.45
     case .road, .curb:
       return -1
-    case .background:
+    case .background, .terrain:
       return nil
     }
   }
 
+  /// Mobilio's strict classes are used to establish that the camera has found
+  /// an actual travel surface. Indoor covering and trained doorway openings
+  /// are included as PathFinder-specific extensions.
+  var strictWalkable: Bool {
+    switch self {
+    case .sidewalk, .plainCrosswalk, .zebraCrosswalk, .covering, .doorwayOpening:
+      return true
+    default:
+      return false
+    }
+  }
+
+  /// Mobilio allows curb pixels in its tolerant ray-cast. We deliberately do
+  /// not: a curb remains a hard semantic boundary until LiDAR and a future
+  /// crossing state can prove that it is safe.
+  var laxWalkable: Bool {
+    switch self {
+    case .curbCut, .sidewalk, .plainCrosswalk, .zebraCrosswalk, .covering, .doorwayOpening:
+      return true
+    default:
+      return false
+    }
+  }
+
   static func fromModelClass(_ rawValue: Int, channelCount: Int) -> WalkableSurfaceClass {
-    // The bundled Tiramisu45 baseline is a 12-channel Cityscapes/CamVid
-    // model. It has reliable road (6) and sidewalk (7) channels, but not the
-    // nine Mobilio labels, so all other classes stay conservative/unknown.
+    // The outdoor baseline has no validated indoor floor/doorway mapping.
+    // Do not reinterpret road logits as floor or let them authorize movement.
     if channelCount == 12 {
-      switch rawValue {
-      case 6: return .road
-      case 7: return .sidewalk
-      default: return .background
-      }
+      return .background
     }
     return WalkableSurfaceClass(rawValue: UInt8(clamping: rawValue)) ?? .background
   }
@@ -65,6 +85,9 @@ struct WalkableSurfaceMask {
   let width: Int
   let height: Int
   let timestamp: TimeInterval
+  var cameraTransform: simd_float4x4?
+  var cameraIntrinsics: simd_float3x3?
+  var imageResolution: CGSize?
 
   func surfaceClass(
     imageX: Float,
@@ -85,9 +108,16 @@ struct WalkableSurfaceMask {
 /// Optional Core ML walkable-surface segmentation. The LiDAR stream remains
 /// fully functional when no model is bundled or an inference fails.
 final class WalkableSurfaceSegmenter {
+  private let lock = NSLock()
+  private let inferenceQueue = DispatchQueue(
+    label: "com.pathfinder.walkable-segmentation",
+    qos: .userInitiated
+  )
   private var lastMask: WalkableSurfaceMask?
   private var lastRun: TimeInterval = -.infinity
-  private let minimumInterval: TimeInterval = 0.18
+  private var inferenceRunning = false
+  private var generation = 0
+  private let minimumInterval: TimeInterval = 0.10
   private let model: VNCoreMLModel?
 
   init() {
@@ -95,33 +125,67 @@ final class WalkableSurfaceSegmenter {
   }
 
   func reset() {
+    lock.lock()
+    defer { lock.unlock() }
+    generation += 1
     lastMask = nil
     lastRun = -.infinity
+    inferenceRunning = false
+  }
+
+  func currentMask() -> WalkableSurfaceMask? {
+    lock.lock()
+    defer { lock.unlock() }
+    return lastMask
   }
 
   func mask(for frame: ARFrame) -> WalkableSurfaceMask? {
     guard let model else { return nil }
-    guard frame.timestamp - lastRun >= minimumInterval else { return lastMask }
-    lastRun = frame.timestamp
 
-    let request = VNCoreMLRequest(model: model)
-    request.imageCropAndScaleOption = .scaleFill
-
-    do {
-      // ARKit's captured buffer and scene-depth buffer use the same native
-      // landscape camera coordinate space, so keep both unrotated here.
-      try VNImageRequestHandler(
-        cvPixelBuffer: frame.capturedImage,
-        orientation: .up
-      ).perform([request])
-      guard let mask = Self.mask(from: request.results, timestamp: frame.timestamp) else {
-        return lastMask
-      }
-      lastMask = mask
-    } catch {
-      // Semantic inference must never interrupt the higher-priority LiDAR loop.
+    lock.lock()
+    let cachedMask = lastMask
+    guard !inferenceRunning, frame.timestamp - lastRun >= minimumInterval else {
+      lock.unlock()
+      return cachedMask
     }
-    return lastMask
+    inferenceRunning = true
+    lastRun = frame.timestamp
+    let activeGeneration = generation
+    lock.unlock()
+
+    let pixelBuffer = frame.capturedImage
+    let timestamp = frame.timestamp
+    let transform = frame.camera.transform
+    let intrinsics = frame.camera.intrinsics
+    let resolution = frame.camera.imageResolution
+    inferenceQueue.async { [weak self] in
+      let request = VNCoreMLRequest(model: model)
+      request.imageCropAndScaleOption = .scaleFill
+      var nextMask: WalkableSurfaceMask?
+      do {
+        // ARKit's captured buffer and scene-depth buffer use the same native
+        // landscape camera coordinate space, so keep both unrotated here.
+        try VNImageRequestHandler(
+          cvPixelBuffer: pixelBuffer,
+          orientation: .up
+        ).perform([request])
+        nextMask = Self.mask(from: request.results, timestamp: timestamp)
+        nextMask?.cameraTransform = transform
+        nextMask?.cameraIntrinsics = intrinsics
+        nextMask?.imageResolution = resolution
+      } catch {
+        // Semantic inference must never interrupt the higher-priority LiDAR loop.
+      }
+
+      guard let self else { return }
+      self.lock.lock()
+      if self.generation == activeGeneration {
+        if let nextMask { self.lastMask = nextMask }
+        self.inferenceRunning = false
+      }
+      self.lock.unlock()
+    }
+    return cachedMask
   }
 
   private static func loadModel() -> VNCoreMLModel? {
@@ -210,7 +274,7 @@ final class WalkableSurfaceSegmenter {
         var bestClass = 0
         if channelCount > 1 {
           var bestScore = -Double.greatestFiniteMagnitude
-          for channel in 0..<min(channelCount, 9) {
+          for channel in 0..<channelCount {
             let offset = channel * strides[channelIndex!]
               + y * strides[heightIndex]
               + x * strides[widthIndex]

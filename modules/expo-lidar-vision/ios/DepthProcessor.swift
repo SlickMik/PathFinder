@@ -43,6 +43,10 @@ final class DepthProcessor {
     personSegmenter.currentMask()
   }
 
+  func currentSurfaceMask() -> WalkableSurfaceMask? {
+    walkableSurfaceSegmenter.currentMask()
+  }
+
   func unknownSnapshot(tracking: String, aim: String, speedMps: Float = 0) -> Payload {
     let unknown = sectorReading(distance: nil, confidence: "low", coverage: 0)
     corridorHistory.removeAll(keepingCapacity: true)
@@ -128,18 +132,22 @@ final class DepthProcessor {
     let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
     let confidenceRowBytes = CVPixelBufferGetBytesPerRow(confidenceMap)
     let now = frame.timestamp
-    if let surfaceMask {
+    if let surfaceMask, now - surfaceMask.timestamp <= 1,
+       let maskTransform = surfaceMask.cameraTransform,
+       let maskIntrinsics = surfaceMask.cameraIntrinsics,
+       let maskResolution = surfaceMask.imageResolution {
+      let maskPosition = SIMD3<Float>(maskTransform.columns.3.x, maskTransform.columns.3.y, maskTransform.columns.3.z)
       observeWalkableSurface(
         mask: surfaceMask,
-        cameraTransform: transform,
+        cameraTransform: maskTransform,
         cameraPosition: cameraPosition,
         forward: forward,
         right: right,
-        floorHeight: floorHeight ?? cameraPosition.y - 1.45,
-        intrinsics: intrinsics,
-        imageWidth: Float(imageResolution.width),
-        imageHeight: Float(imageResolution.height),
-        timestamp: now
+        floorHeight: floorHeight ?? maskPosition.y - 1.45,
+        intrinsics: maskIntrinsics,
+        imageWidth: Float(maskResolution.width),
+        imageHeight: Float(maskResolution.height),
+        timestamp: surfaceMask.timestamp
       )
     }
     var examined = 0
@@ -193,7 +201,12 @@ final class DepthProcessor {
           depthWidth: width,
           depthHeight: height
         ) ?? false
-        let isRouteObstacle = isPerson || (!onDetectedFloor && relativeHeight > -1.30)
+        let withinBodyHeight = floorHeight.map {
+          worldPoint.y > $0 + 0.08 && worldPoint.y < $0 + 2.0
+        } ?? (relativeHeight > -1.30 && relativeHeight < 0.5)
+        let isRouteObstacle = isPerson || (!onDetectedFloor && withinBodyHeight)
+        // Ceiling returns must not carve a free route underneath their rays.
+        guard onDetectedFloor || isRouteObstacle else { continue }
         if ((pixelX / sampleStride) + (pixelY / sampleStride)).isMultiple(of: 2) {
           routePlanner.observeRay(
             from: cameraPosition,
@@ -326,27 +339,44 @@ final class DepthProcessor {
     let cx = intrinsics.columns.2.x
     let cy = intrinsics.columns.2.y
 
+    let project: (Float, Float, Bool) -> Void = { longitudinal, lateral, includeInLocalGrid in
+      var worldPoint = cameraPosition + forward * longitudinal + right * lateral
+      worldPoint.y = floorHeight
+      let cameraPoint = worldToCamera * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1)
+      let depth = -cameraPoint.z
+      guard depth > 0.1 else { return }
+      let imageX = cameraPoint.x * fx / depth + cx
+      let imageY = cy - cameraPoint.y * fy / depth
+      guard let surfaceClass = mask.surfaceClass(
+        imageX: imageX,
+        imageY: imageY,
+        imageWidth: imageWidth,
+        imageHeight: imageHeight
+      ) else { return }
+      self.routePlanner.observeSurface(
+        at: worldPoint,
+        traversability: surfaceClass.traversability,
+        laxWalkable: surfaceClass.laxWalkable,
+        strictWalkable: surfaceClass.strictWalkable,
+        className: surfaceClass.name,
+        timestamp: timestamp,
+        includeInLocalGrid: includeInLocalGrid
+      )
+    }
+
+    // Fine near-field sampling feeds the LiDAR-fused A* planner.
     for longitudinal in stride(from: 0.35 as Float, through: 3.2, by: 0.10) {
       for lateral in stride(from: -1.8 as Float, through: 1.8, by: 0.10) {
-        var worldPoint = cameraPosition + forward * longitudinal + right * lateral
-        worldPoint.y = floorHeight
-        let cameraPoint = worldToCamera * SIMD4<Float>(worldPoint.x, worldPoint.y, worldPoint.z, 1)
-        let depth = -cameraPoint.z
-        guard depth > 0.1 else { continue }
-        let imageX = cameraPoint.x * fx / depth + cx
-        let imageY = cy - cameraPoint.y * fy / depth
-        guard let surfaceClass = mask.surfaceClass(
-          imageX: imageX,
-          imageY: imageY,
-          imageWidth: imageWidth,
-          imageHeight: imageHeight
-        ), let traversability = surfaceClass.traversability else { continue }
-        routePlanner.observeSurface(
-          at: worldPoint,
-          traversability: traversability,
-          className: surfaceClass.name,
-          timestamp: timestamp
-        )
+        project(longitudinal, lateral, true)
+      }
+    }
+
+    // Mobilio's larger 0.2 m semantic grid supplies longer-range heading and
+    // branch context without claiming that LiDAR has cleared those far cells.
+    for longitudinal in stride(from: 3.4 as Float, through: 15, by: 0.20) {
+      let halfWidth = min(8 as Float, max(2, longitudinal * 0.75))
+      for lateral in stride(from: -halfWidth, through: halfWidth, by: 0.20) {
+        project(longitudinal, lateral, false)
       }
     }
   }

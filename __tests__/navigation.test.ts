@@ -2,6 +2,7 @@ import {
   INITIAL_NAVIGATION_GUIDANCE,
   planNavigation,
   reduceNavigationGuidance,
+  surfacePhrase,
 } from '../features/scanning/navigation';
 import { safetyEnvelopeForSpeed } from '../features/scanning/motionSafety';
 import type { ObstacleSnapshot, SectorReading } from '../features/scanning/types';
@@ -106,6 +107,13 @@ describe('reactive LiDAR navigation', () => {
     const result = planNavigation(value, envelope);
     expect(result.instruction).toBe('slight-left');
     expect(result.source).toBe('segmented-path');
+    expect(result.surfaceClass).toBe('sidewalk');
+  });
+
+  it('announces navigation-relevant surface transitions', () => {
+    expect(surfacePhrase('doorway-opening')).toBe('Doorway ahead.');
+    expect(surfacePhrase('zebra-crosswalk')).toBe('Crosswalk ahead.');
+    expect(surfacePhrase('terrain')).toBeNull();
   });
 
   it('falls back to sectors while the local route map is still uncertain', () => {

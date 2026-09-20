@@ -19,7 +19,9 @@ short-range indoor guidance.
 - Clearance-aware A* routing that inflates obstacles by body width plus a side margin
 - Narrow-opening guidance that only accepts an observed gap wide enough for that envelope
 - Optional Core ML walkable-surface segmentation projected into the world map with ARKit odometry
-- Live camera debugging with magenta person segmentation, route overlay, and a world-space trace
+- A Mobilio-derived 0.2 m semantic grid with 181-ray heading search, gap tolerance, smoothing,
+  and left/right branch detection, fused as a preference beneath LiDAR safety constraints
+- Live camera debugging with a blue walkable-route overlay and red obstacle segmentation
 - Apple's on-device person segmentation fused with LiDAR distance; person evidence expires quickly
 - On-device spoken steering through the iOS speech synthesizer
 - VoiceOver-friendly controls, large Dynamic Type, and an explicit safety boundary
@@ -46,15 +48,17 @@ Or open `ios/PathFinder.xcworkspace` in Xcode, select the PathFinder scheme and 
 iPhone, set your Apple Development team under Signing & Capabilities, and press Run. Open the
 workspace—not the `.xcodeproj`—so CocoaPods and the native LiDAR module are included.
 
-Start scanning to open the live spatial view. The camera refreshes automatically, people found by
-the on-device Vision model are highlighted in magenta, and the planner route is drawn over the
-scene. The lower trace shows the same route from above in phone-relative metres. The camera route
-projection is intentionally approximate for debugging. Rebuild the iOS development client after
-changing native camera, segmentation, or route code.
+Start scanning to open the live spatial view. Once ARKit detects the floor, the camera colors
+measured floor pixels blue and body-height object surfaces red using that frame's LiDAR data.
+The lower map shows the planned route and obstacles in phone-relative metres. The bundled outdoor
+model is not trusted to classify indoor floors; trained compatible replacements can enable semantic
+routing. Rebuild the app after changing native camera, segmentation, or route code.
 
 The segmentation-to-guidance pipeline is implemented with a bundled Cityscapes/CamVid Core ML
-baseline (road and sidewalk classes). See [walkable-path segmentation](docs/walkable-path-segmentation.md)
-for the model contract, training recommendation, class mapping, and safety gates.
+baseline and a native adaptation of Mobilio's `Vision.cs` route logic. See
+[walkable-path segmentation](docs/walkable-path-segmentation.md) for the model contract, porting
+decisions, training recommendation, class mapping, and safety gates. Mobilio attribution and its
+MIT license are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 For a shared device build, configure Apple signing and run `eas build --profile development
 --platform ios`.
