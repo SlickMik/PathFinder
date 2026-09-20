@@ -1,10 +1,11 @@
 import { createAudioPlayer, type AudioPlayer } from 'expo-audio';
+import { SCENE_URL } from './backendConfig';
+import { CLOUD_AI_ENABLED } from './featureFlags';
 
 // ElevenLabs-backed natural voice, streamed sentence-by-sentence through the
 // proxy's GET /tts endpoint. Availability is probed once from /health; every
 // failure falls back to the caller's on-device TTS path so speech never dies.
 
-const SCENE_URL = process.env.EXPO_PUBLIC_SCENE_DESCRIBE_URL;
 const BASE_URL = SCENE_URL?.replace('/describe-scene', '');
 const APP_SECRET = process.env.EXPO_PUBLIC_SCENE_APP_SECRET;
 
@@ -12,6 +13,7 @@ let available: boolean | null = null;
 let probing: Promise<boolean> | null = null;
 
 export function naturalVoiceAvailable(): Promise<boolean> {
+  if (!CLOUD_AI_ENABLED) return Promise.resolve(false);
   if (available !== null) return Promise.resolve(available);
   probing ??= (async () => {
     try {

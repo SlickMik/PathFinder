@@ -30,6 +30,7 @@ const LIDAR = {
 
 let passed = 0;
 let failed = 0;
+let cloudEnabled = false;
 
 async function post(path, body, timeoutMs = 30_000) {
   const controller = new AbortController();
@@ -70,8 +71,17 @@ await check('health endpoint', async () => {
   const res = await fetch(`${BASE}/health`);
   const json = await res.json();
   expect(json.ok === true, 'health not ok');
+  cloudEnabled = Boolean(json.cloudAi ?? json.ai);
   return `models: ${json.model} + ${json.companionModel}`;
 });
+
+if (!cloudEnabled) {
+  console.log(
+    '  SKIP  cloud checks — CLOUD_AI_ENABLED is false. Set CLOUD_AI_ENABLED=true in server/.env to run them.',
+  );
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed === 0 ? 0 : 1);
+}
 
 await check('companion: LiDAR-only spatial answer', async () => {
   const { status, json, ms } = await post('/companion', {

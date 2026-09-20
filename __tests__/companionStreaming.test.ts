@@ -14,6 +14,7 @@ import type { companionSay as CompanionSay } from '../features/speech/companion'
 // Must be set before companion.ts is evaluated, since it reads the env var at
 // module load to derive COMPANION_URL.
 process.env.EXPO_PUBLIC_SCENE_DESCRIBE_URL = 'http://test.local/describe-scene';
+process.env.EXPO_PUBLIC_CLOUD_AI_ENABLED = 'true';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { companionSay } = require('../features/speech/companion') as {

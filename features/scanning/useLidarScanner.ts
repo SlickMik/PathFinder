@@ -17,6 +17,12 @@ import {
   reduceNavigationGuidance,
   surfacePhrase,
 } from './navigation';
+import {
+  localSceneFallback,
+  localSensorReply,
+  needsVisualContext,
+} from './localCompanion';
+import { CLOUD_AI_ENABLED } from '../speech/featureFlags';
 import type {
   AlertState,
   LidarSupport,
@@ -48,14 +54,14 @@ export function useLidarScanner() {
   const alertRef = useRef(INITIAL_ALERT_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
   const snapshotRef = useRef<ObstacleSnapshot | null>(null);
-  // Sponsor experience (Baseten-powered companion) is on by default;
-  // deterministic local alerts still take priority over all of it.
-  const companionRef = useRef(true);
-  const [companion, setCompanionState] = useState(true);
-  // Spoken obstacle/guidance alerts ("Stop", "Obstacle left"). OFF by default
-  // so they don't talk over the companion — haptics always stay on regardless.
-  const alertVoiceRef = useRef(false);
-  const [alertVoice, setAlertVoiceState] = useState(false);
+  // Navigation starts quiet except for concise, deterministic guidance. The
+  // conversational companion remains opt-in so it never masks safety speech.
+  const companionRef = useRef(false);
+  const [companion, setCompanionState] = useState(false);
+  // Spoken obstacle and route guidance is a primary accessibility channel.
+  // Haptics remain active regardless of this preference.
+  const alertVoiceRef = useRef(true);
+  const [alertVoice, setAlertVoiceState] = useState(true);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({
     instruction: 'hold',
@@ -392,9 +398,14 @@ export function useLidarScanner() {
 
   const describeScene = useCallback(async () => {
     if (!active) return;
+    if (!CLOUD_AI_ENABLED) {
+      announce(localSceneFallback(snapshotRef.current, alertRef.current, guidanceRef.current));
+      return;
+    }
+    let receivedCloudSpeech = false;
     try {
       announce('Describing scene.');
-      // Structured hazards (Baseten structured outputs) in parallel — lands in
+      // Structured Gemini hazards run in parallel and land in
       // the UI whenever ready, never delays the spoken description.
       void fetchSceneHazards(snapshotRef.current)
         .then(setSceneHazards)
@@ -409,17 +420,28 @@ export function useLidarScanner() {
         ? await companionSay('What do you see around us right now?', {
             snapshot: snapshotRef.current,
             withFrame: true,
-            onDelta: (delta) => speech.push(delta),
+            onDelta: (delta) => {
+              receivedCloudSpeech = true;
+              speech.push(delta);
+            },
           })
-        : await describeCurrentScene(snapshotRef.current, (delta) => speech.push(delta));
+        : await describeCurrentScene(snapshotRef.current, (delta) => {
+            receivedCloudSpeech = true;
+            speech.push(delta);
+          });
       await speech.done();
       console.log(`[describe-scene] reply: "${text}"`);
     } catch (error) {
-      announce(error instanceof Error ? error.message : 'Unable to describe the scene.');
+      console.warn('[describe-scene] cloud description failed:', error);
+      if (!receivedCloudSpeech) {
+        announce(
+          localSceneFallback(snapshotRef.current, alertRef.current, guidanceRef.current),
+        );
+      }
     }
   }, [active, announce]);
   const tryUnderstandAudio = useCallback(
-    async (audioUri: string, recentEvents: string[]) => {
+    async (audioUri: string, recentEvents: string[], withFrame: boolean) => {
       try {
         const audioBase64 = await readAsStringAsync(audioUri, { encoding: 'base64' });
         const extension = audioUri.split('.').pop()?.toLowerCase() ?? 'caf';
@@ -430,14 +452,14 @@ export function useLidarScanner() {
           alert: alertRef.current,
           guidance: guidanceRef.current,
           events: recentEvents,
-          withFrame: active,
+          withFrame,
         });
       } catch (error) {
         console.warn('[companion] audio read failed, using local transcript:', error);
         return null;
       }
     },
-    [active],
+    [],
   );
 
   const askCompanion = useCallback(
@@ -451,13 +473,40 @@ export function useLidarScanner() {
           .filter((entry) => now - entry.at < 90_000)
           .map((entry) => `${Math.round((now - entry.at) / 1000)}s ago: ${entry.event}`);
 
-        // GPT ears: when the raw audio was persisted and the backend has
-        // OpenAI configured, send the audio itself — GPT hears the original
+        const localReply = localSensorReply(
+          text,
+          snapshotRef.current,
+          alertRef.current,
+          guidanceRef.current,
+        );
+        if (localReply) {
+          console.log(`[companion] answered on device: "${localReply}"`);
+          await speak(
+            localReply,
+            alertRef.current.risk === 'critical' ||
+              guidanceRef.current.instruction === 'stop',
+          );
+          return;
+        }
+
+        if (!CLOUD_AI_ENABLED) {
+          await speak(
+            localSceneFallback(snapshotRef.current, alertRef.current, guidanceRef.current),
+            alertRef.current.risk === 'critical' ||
+              guidanceRef.current.instruction === 'stop',
+          );
+          return;
+        }
+
+        const withFrame = active && needsVisualContext(text);
+
+        // Gemini ears: when raw audio was persisted and Gemini is configured,
+        // send the audio itself so the model hears the original
         // speech (noise, accents, mumbles) instead of trusting on-device STT.
         if (audioUri) {
-          const understood = await tryUnderstandAudio(audioUri, recentEvents);
+          const understood = await tryUnderstandAudio(audioUri, recentEvents, withFrame);
           if (understood) {
-            console.log(`[companion] GPT heard: "${understood.transcript}"`);
+            console.log(`[companion] Gemini heard: "${understood.transcript}"`);
             console.log(`[companion] reply: "${understood.reply}"`);
             const speech = speakStream(() => alertRef.current.risk !== 'critical');
             speech.push(understood.reply);
@@ -476,8 +525,9 @@ export function useLidarScanner() {
           alert: alertRef.current,
           guidance: guidanceRef.current,
           events: recentEvents,
-          // Walking companion: every voice turn gets fresh eyes while scanning.
-          withFrame: active,
+          // Only visual questions get a frame. Sensor questions were already
+          // answered locally above, and casual conversation needs no upload.
+          withFrame,
           onDelta: (delta) => speech.push(delta),
         });
         await speech.done();
@@ -498,6 +548,10 @@ export function useLidarScanner() {
   }, []);
 
   const toggleCompanion = useCallback(() => {
+    if (!CLOUD_AI_ENABLED) {
+      void speak('Cloud companion is off. Local guidance is still active.', true);
+      return;
+    }
     const next = !companionRef.current;
     companionRef.current = next;
     setCompanionState(next);

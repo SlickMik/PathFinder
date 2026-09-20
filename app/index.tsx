@@ -1,10 +1,23 @@
+import { GuidanceInstrument } from '../components/GuidanceInstrument';
+import { OrientationToggle, type AppOrientation } from '../components/OrientationToggle';
 import { ScanControl } from '../components/ScanControl';
 import { RouteDebugOverlay } from '../components/RouteDebugOverlay';
 import { SectorStatus } from '../components/SectorStatus';
 import { StatusAnnouncement } from '../components/StatusAnnouncement';
 import { useLidarScanner } from '../features/scanning/useLidarScanner';
 import { useVoiceInput } from '../features/speech/useVoiceInput';
-import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import * as ScreenOrientation from 'expo-screen-orientation';
+import {
+  AccessibilityInfo,
+  Image,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  useWindowDimensions,
+  View,
+} from 'react-native';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -16,18 +29,14 @@ const RISK_LABEL = {
   critical: 'STOP',
 } as const;
 
-const GUIDANCE_LABEL = {
-  hold: 'HOLD POSITION',
-  stop: 'STOP',
-  straight: 'GO STRAIGHT',
-  'slight-left': 'GO SLIGHTLY LEFT',
-  left: 'GO LEFT',
-  'slight-right': 'GO SLIGHTLY RIGHT',
-  right: 'GO RIGHT',
-} as const;
-
 export default function ScannerScreen() {
   const scanner = useLidarScanner();
+  const { height, width } = useWindowDimensions();
+  const detectedOrientation: AppOrientation = width > height ? 'landscape' : 'portrait';
+  const [orientationOverride, setOrientationOverride] = useState<AppOrientation | null>(null);
+  const orientation = orientationOverride ?? detectedOrientation;
+  const [orientationBusy, setOrientationBusy] = useState(false);
+  const isLandscape = orientation === 'landscape';
 
   // Walk & talk: hands-free conversation loop. Listen -> user speaks ->
   // companion replies (mic closed while it talks) -> listen again.
@@ -59,6 +68,30 @@ export default function ScannerScreen() {
   useEffect(() => {
     voiceRef.current = voice;
   }, [voice]);
+
+  const changeOrientation = useCallback(async (next: AppOrientation) => {
+    if (next === orientation || orientationBusy) return;
+    setOrientationBusy(true);
+    try {
+      if (Platform.OS !== 'web') {
+        await ScreenOrientation.lockAsync(
+          next === 'portrait'
+            ? ScreenOrientation.OrientationLock.PORTRAIT_UP
+            : ScreenOrientation.OrientationLock.LANDSCAPE,
+        );
+      }
+      setOrientationOverride(next);
+      AccessibilityInfo.announceForAccessibility(
+        `${next === 'portrait' ? 'Vertical' : 'Horizontal'} orientation selected.`,
+      );
+    } catch {
+      AccessibilityInfo.announceForAccessibility(
+        'Unable to change orientation on this device.',
+      );
+    } finally {
+      setOrientationBusy(false);
+    }
+  }, [orientation, orientationBusy]);
 
   const toggleWalkTalk = useCallback(() => {
     const next = !walkTalkRef.current;
@@ -95,7 +128,10 @@ export default function ScannerScreen() {
       <SafeAreaView style={styles.safeArea}>
         <ScrollView
           alwaysBounceVertical={false}
-          contentContainerStyle={styles.content}
+          contentContainerStyle={[
+            styles.content,
+            isLandscape ? styles.contentLandscape : styles.contentPortrait,
+          ]}
           showsVerticalScrollIndicator={false}
         >
         <View style={styles.header}>
@@ -118,98 +154,87 @@ export default function ScannerScreen() {
           </View>
         </View>
 
-        <ScanControl
-          active={scanner.active}
-          disabled={unsupported || busy}
-          onPress={() => (scanner.active ? void scanner.stop() : void scanner.start())}
-          status={scanner.status}
+        <OrientationToggle
+          disabled={orientationBusy}
+          onChange={(next) => void changeOrientation(next)}
+          value={orientation}
         />
 
-        <RouteDebugOverlay
-          active={scanner.active}
-          frame={scanner.liveDebugFrame}
-          guidance={scanner.guidance}
-          route={snapshot?.route}
-        />
+        <View style={[styles.dashboard, isLandscape && styles.dashboardLandscape]}>
+          <View style={styles.primaryColumn}>
+            <ScanControl
+              active={scanner.active}
+              disabled={unsupported || busy}
+              onPress={() => (scanner.active ? void scanner.stop() : void scanner.start())}
+              status={scanner.status}
+            />
 
-        {scanner.liveDebugError ? (
-          <Text accessibilityRole="alert" style={styles.previewError}>
-            Live preview: {scanner.liveDebugError}
-          </Text>
-        ) : null}
+            <StatusAnnouncement
+              deviceAim={snapshot?.deviceAim}
+              errorMessage={scanner.errorMessage}
+              status={scanner.status}
+              tracking={snapshot?.tracking}
+            />
 
-        <StatusAnnouncement
-          deviceAim={snapshot?.deviceAim}
-          errorMessage={scanner.errorMessage}
-          status={scanner.status}
-          tracking={snapshot?.tracking}
-        />
+            <GuidanceInstrument
+              active={scanner.active}
+              guidance={scanner.guidance}
+              speedMps={scanner.safetyEnvelope.speedMps}
+              warningDistanceM={scanner.safetyEnvelope.warningDistanceM}
+            />
 
-        <View
-          accessible
-          accessibilityRole="summary"
-          accessibilityLabel={`Guidance: ${GUIDANCE_LABEL[scanner.guidance.instruction]}. Moving ${scanner.safetyEnvelope.speedMps.toFixed(1)} metres per second. Warning distance ${scanner.safetyEnvelope.warningDistanceM.toFixed(1)} metres.`}
-          style={styles.guidancePanel}
-        >
-          <Text maxFontSizeMultiplier={1.6} style={styles.guidanceEyebrow}>
-            ROUTE GUIDANCE
-          </Text>
-          <Text maxFontSizeMultiplier={1.5} style={styles.guidanceText}>
-            {scanner.active ? GUIDANCE_LABEL[scanner.guidance.instruction] : 'READY'}
-          </Text>
-          <View style={styles.motionRow}>
-            <Text maxFontSizeMultiplier={1.4} style={styles.motionMetric}>
-              SPEED {scanner.safetyEnvelope.speedMps.toFixed(1)} M/S
-            </Text>
-            <Text maxFontSizeMultiplier={1.4} style={styles.motionMetric}>
-              WARN {scanner.safetyEnvelope.warningDistanceM.toFixed(1)} M
-            </Text>
+            <View
+              accessible
+              accessibilityRole="alert"
+              accessibilityLabel={`${riskLabel}. ${riskDetail}.`}
+              style={[
+                styles.riskPanel,
+                scanner.alert.risk === 'critical' && scanner.active && styles.criticalPanel,
+              ]}
+            >
+              <Text maxFontSizeMultiplier={1.8} style={styles.riskLabel}>
+                {riskLabel}
+              </Text>
+              <Text maxFontSizeMultiplier={2} style={styles.riskDetail}>
+                {riskDetail}
+              </Text>
+              {scanner.active && snapshot?.corridor.timeToContactS != null ? (
+                <Text maxFontSizeMultiplier={1.7} style={styles.ttc}>
+                  Estimated contact in {snapshot.corridor.timeToContactS.toFixed(1)} seconds
+                </Text>
+              ) : null}
+            </View>
           </View>
-          {scanner.active && scanner.guidance.isNarrowOpening ? (
-            <Text maxFontSizeMultiplier={1.5} style={styles.narrowOpening}>
-              NARROW OPENING · KEEP CENTERED
-              {scanner.guidance.openingWidthM != null
-                ? ` · ${scanner.guidance.openingWidthM.toFixed(1)} M`
-                : ''}
-            </Text>
-          ) : null}
-        </View>
 
-        <View
-          accessible
-          accessibilityRole="alert"
-          accessibilityLabel={`${riskLabel}. ${riskDetail}.`}
-          style={[
-            styles.riskPanel,
-            scanner.alert.risk === 'critical' && scanner.active && styles.criticalPanel,
-          ]}
-        >
-          <Text maxFontSizeMultiplier={1.6} style={styles.riskLabel}>
-            {riskLabel}
-          </Text>
-          <Text maxFontSizeMultiplier={1.6} style={styles.riskDetail}>
-            {riskDetail}
-          </Text>
-          {scanner.active && snapshot?.corridor.timeToContactS != null ? (
-            <Text maxFontSizeMultiplier={1.5} style={styles.ttc}>
-              Estimated contact in {snapshot.corridor.timeToContactS.toFixed(1)} seconds
-            </Text>
-          ) : null}
-        </View>
+          <View style={styles.secondaryColumn}>
+            <RouteDebugOverlay
+              active={scanner.active}
+              frame={scanner.liveDebugFrame}
+              guidance={scanner.guidance}
+              route={snapshot?.route}
+            />
 
-        <View style={styles.sectionHeader}>
-          <Text maxFontSizeMultiplier={1.6} style={styles.sectionTitle}>
-            Forward sectors
-          </Text>
-          <Text maxFontSizeMultiplier={1.4} style={styles.sectionMeta}>
-            LOCAL · 10 HZ
-          </Text>
-        </View>
+            {scanner.liveDebugError ? (
+              <Text accessibilityRole="alert" style={styles.previewError}>
+                Live preview: {scanner.liveDebugError}
+              </Text>
+            ) : null}
 
-        <View style={styles.sectors}>
-          <SectorStatus active={scanner.active} reading={snapshot?.left ?? null} sector="left" />
-          <SectorStatus active={scanner.active} reading={snapshot?.center ?? null} sector="center" />
-          <SectorStatus active={scanner.active} reading={snapshot?.right ?? null} sector="right" />
+            <View style={styles.sectionHeader}>
+              <Text maxFontSizeMultiplier={1.8} style={styles.sectionTitle}>
+                Space ahead
+              </Text>
+              <Text maxFontSizeMultiplier={1.5} style={styles.sectionMeta}>
+                ON DEVICE · LIVE
+              </Text>
+            </View>
+
+            <View style={styles.sectors}>
+              <SectorStatus active={scanner.active} reading={snapshot?.left ?? null} sector="left" />
+              <SectorStatus active={scanner.active} reading={snapshot?.center ?? null} sector="center" />
+              <SectorStatus active={scanner.active} reading={snapshot?.right ?? null} sector="right" />
+            </View>
+          </View>
         </View>
 
         <Pressable
@@ -346,9 +371,36 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
   },
   content: {
+    width: '100%',
+    maxWidth: 1180,
+    alignSelf: 'center',
     paddingHorizontal: 20,
     paddingTop: 18,
     paddingBottom: 36,
+    gap: 18,
+  },
+  contentLandscape: {
+    paddingHorizontal: 28,
+    paddingTop: 14,
+  },
+  contentPortrait: {
+    maxWidth: 720,
+  },
+  dashboard: {
+    gap: 18,
+  },
+  dashboardLandscape: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  primaryColumn: {
+    flex: 1.04,
+    minWidth: 0,
+    gap: 18,
+  },
+  secondaryColumn: {
+    flex: 0.96,
+    minWidth: 0,
     gap: 18,
   },
   header: {
@@ -442,48 +494,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     padding: 24,
-  },
-  guidancePanel: {
-    borderRadius: 20,
-    backgroundColor: '#F2FF63',
-    paddingHorizontal: 22,
-    paddingVertical: 19,
-    gap: 5,
-  },
-  guidanceEyebrow: {
-    color: '#353A09',
-    fontSize: 11,
-    lineHeight: 15,
-    fontWeight: '900',
-    letterSpacing: 1.5,
-  },
-  guidanceText: {
-    color: '#0B0D10',
-    fontSize: 29,
-    lineHeight: 35,
-    fontWeight: '900',
-    letterSpacing: 0.4,
-  },
-  motionRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 12,
-    marginTop: 4,
-  },
-  motionMetric: {
-    color: '#353A09',
-    fontSize: 12,
-    lineHeight: 17,
-    fontWeight: '800',
-    letterSpacing: 0.6,
-  },
-  narrowOpening: {
-    color: '#0B0D10',
-    fontSize: 12,
-    lineHeight: 17,
-    fontWeight: '900',
-    letterSpacing: 0.5,
-    marginTop: 4,
   },
   criticalPanel: {
     backgroundColor: '#561E20',

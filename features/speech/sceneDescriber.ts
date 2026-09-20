@@ -1,16 +1,16 @@
 import { ExpoLidarVision } from '../../modules/expo-lidar-vision';
+import { APP_SECRET, SCENE_URL } from './backendConfig';
+import { CLOUD_AI_ENABLED } from './featureFlags';
 import type { ObstacleSnapshot, SectorReading } from '../scanning/types';
 
-const SCENE_URL = process.env.EXPO_PUBLIC_SCENE_DESCRIBE_URL;
-const APP_SECRET = process.env.EXPO_PUBLIC_SCENE_APP_SECRET;
 const REQUEST_TIMEOUT_MS = 15_000;
 // Streamed replies get a larger no-delta budget: a cold vision model can take
 // ~13s to its first token, and the stall timer only resets once tokens flow,
 // so the pre-first-token window needs more headroom than a buffered round-trip.
 const STREAM_TIMEOUT_MS = 25_000;
 
-// Compact LiDAR context per PLAN.md §8 — sector distances and tracking
-// quality only, never the full depth map.
+// Compact on-device context: sector distances plus the route planner's
+// segmentation-grounded facts, never the full depth map or mask.
 type LidarContext = {
   left: { distanceM: number; confidence: string } | null;
   center: { distanceM: number; confidence: string } | null;
@@ -20,6 +20,17 @@ type LidarContext = {
   timeToContactS: number | null;
   tracking: string;
   ageMs: number;
+  route: {
+    instruction: string;
+    status: string;
+    minimumClearanceM: number | null;
+    openingWidthM: number | null;
+    confidence: number;
+    source: string | null;
+    surfaceClass: string | null;
+    isNarrowOpening: boolean;
+    branches: Array<{ direction: 'left' | 'right'; distanceM: number }>;
+  } | null;
 };
 
 function compactSector(reading: SectorReading): LidarContext['left'] {
@@ -32,6 +43,7 @@ function compactSector(reading: SectorReading): LidarContext['left'] {
 
 export function compactLidarContext(snapshot: ObstacleSnapshot | null): LidarContext | null {
   if (!snapshot) return null;
+  const route = snapshot.route;
   return {
     left: compactSector(snapshot.left),
     center: compactSector(snapshot.center),
@@ -47,6 +59,28 @@ export function compactLidarContext(snapshot: ObstacleSnapshot | null): LidarCon
         : null,
     tracking: snapshot.tracking,
     ageMs: Math.max(0, Date.now() - snapshot.timestampMs),
+    route: route
+      ? {
+          instruction: route.instruction,
+          status: route.status,
+          minimumClearanceM:
+            route.minimumClearanceM === null
+              ? null
+              : Math.round(route.minimumClearanceM * 10) / 10,
+          openingWidthM:
+            route.openingWidthM === null
+              ? null
+              : Math.round(route.openingWidthM * 10) / 10,
+          confidence: Math.round(route.confidence * 100) / 100,
+          source: route.source ?? null,
+          surfaceClass: route.surfaceClass ?? null,
+          isNarrowOpening: route.isNarrowOpening,
+          branches: (route.branches ?? []).slice(0, 3).map((branch) => ({
+            direction: branch.direction,
+            distanceM: Math.round(branch.distanceM * 10) / 10,
+          })),
+        }
+      : null,
   };
 }
 
@@ -59,14 +93,14 @@ export type SceneHazard = {
 
 const HAZARDS_URL = SCENE_URL?.replace('/describe-scene', '/hazards');
 
-// Structured hazard extraction (Baseten structured outputs, GLM-5.3-Flash).
+// Structured hazard extraction through Gemini.
 // Fired in parallel with the spoken description using the same frame — never
 // blocks or delays speech.
 async function fetchHazards(
   imageBase64: string,
   snapshot: ObstacleSnapshot | null,
 ): Promise<SceneHazard[]> {
-  if (!HAZARDS_URL) return [];
+  if (!CLOUD_AI_ENABLED || !HAZARDS_URL) return [];
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -97,7 +131,7 @@ let inFlight: Promise<string> | null = null;
 
 // Grabs the current ARKit camera frame and posts it, with compact LiDAR
 // context, to the trusted scene-description proxy (server/index.mjs), which
-// holds the Baseten API key. Frames are only sent on explicit request, and
+// holds the Gemini API key. Frames are only sent on explicit request, and
 // repeated requests coalesce onto the one already in flight.
 export function describeCurrentScene(
   snapshot: ObstacleSnapshot | null = null,
@@ -114,6 +148,7 @@ export function describeCurrentScene(
 export async function fetchSceneHazards(
   snapshot: ObstacleSnapshot | null,
 ): Promise<SceneHazard[]> {
+  if (!CLOUD_AI_ENABLED) return [];
   const frame = await ExpoLidarVision.captureFrame(512, 0.5);
   const hazards = await fetchHazards(frame.base64, snapshot);
   console.log(`[hazards] received ${hazards.length}`);
@@ -124,6 +159,7 @@ async function requestDescription(
   snapshot: ObstacleSnapshot | null,
   onDelta?: (delta: string) => void,
 ): Promise<string> {
+  if (!CLOUD_AI_ENABLED) throw new Error('Cloud AI is disabled.');
   if (!SCENE_URL) throw new Error('Scene description backend is not configured.');
 
   // 512px halves the vision-token count vs 768px — fastest useful size.

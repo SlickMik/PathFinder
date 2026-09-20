@@ -1,6 +1,6 @@
 // PathFinder scene-description proxy.
 //
-// Holds the Baseten API key server-side (never ship it in the Expo bundle),
+// Holds the Gemini API key server-side (never ship it in the Expo bundle),
 // accepts a single deliberately captured camera frame plus compact LiDAR
 // context, and returns a short, uncertainty-aware description.
 //
@@ -9,8 +9,8 @@
 //   node server/index.mjs
 //
 // Env (server/.env or process env):
-//   BASETEN_API_KEY    required
-//   BASETEN_MODEL      default: zai-org/GLM-5.3-Flash
+//   GEMINI_API_KEY     required for cloud descriptions/conversation
+//   GEMINI_MODEL       default: gemini-3.8-flash
 //   APP_SHARED_SECRET  optional; if set, requests must send x-app-secret
 //   PORT               default: 8787
 
@@ -31,35 +31,33 @@ try {
 }
 
 const PORT = Number(process.env.PORT ?? 8787);
-const BASETEN_API_KEY = process.env.BASETEN_API_KEY;
-const MODEL = process.env.BASETEN_MODEL ?? 'zai-org/GLM-5.3-Flash';
-// Conversational companion model — Moonshot AI's Kimi is chatty AND accepts
-// images, so one model can both banter and see.
-const COMPANION_MODEL = process.env.BASETEN_COMPANION_MODEL ?? 'moonshotai/Kimi-K2.6';
-// Fastest vision-capable GPU model on Baseten — used for any turn that
-// carries a camera frame so replies come back quicker.
-const FAST_VISION_MODEL = process.env.BASETEN_FAST_VISION_MODEL ?? 'zai-org/GLM-5.3-Flash';
-// Optional integrations — the app degrades gracefully when these are absent.
-// ElevenLabs: natural voice out. OpenAI: understands the user's raw audio
-// (better than on-device STT in noise/accents); the reply brain stays Baseten.
+const CLOUD_AI_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CLOUD_AI_ENABLED ?? 'false');
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || null;
+const MODEL = process.env.GEMINI_MODEL ?? 'gemini-3.8-flash';
+const COMPANION_MODEL = process.env.GEMINI_COMPANION_MODEL ?? MODEL;
+const FAST_VISION_MODEL = process.env.GEMINI_VISION_MODEL ?? MODEL;
+// Optional natural voice output. Gemini handles vision, conversation, and
+// raw-audio understanding; ElevenLabs only turns the final text into speech.
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
 // Sarah is a current premade voice available to free-tier API accounts; the
 // former Rachel library voice now returns `paid_plan_required` for those keys.
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? 'EXAVITQu4vr4xnSDxMaL';
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_turbo_v2_5';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
-const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe';
 const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
 // Overridable for local testing against a mock upstream.
-const BASETEN_URL = process.env.BASETEN_URL ?? 'https://inference.baseten.co/v1/chat/completions';
+const GEMINI_BASE_URL =
+  process.env.GEMINI_BASE_URL ?? 'https://generativelanguage.googleapis.com/v1beta';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // one compressed 768px JPEG fits easily
 const UPSTREAM_TIMEOUT_MS = 25_000;
 const RATE_LIMIT = { windowMs: 60_000, max: 12 }; // per client IP
 
-if (!BASETEN_API_KEY) {
-  console.error('BASETEN_API_KEY is not set. Create server/.env (see .env.example).');
-  process.exit(1);
+if (!CLOUD_AI_ENABLED) {
+  console.warn('[startup] Cloud AI is disabled by CLOUD_AI_ENABLED=false; local-only mode is active.');
+} else if (!GEMINI_API_KEY) {
+  console.warn(
+    '[startup] GEMINI_API_KEY is not set. Local navigation and ElevenLabs TTS can run, but cloud scene features will return 503.',
+  );
 }
 
 // Encodes the description policy from PLAN.md §8. Kept server-side so the
@@ -83,6 +81,7 @@ Style:
 - Acknowledge journey moments casually ("Alright, out the door — feels like a good morning for it.").
 - Remember and refer back to earlier parts of the conversation and journey.
 - If a camera frame is attached, weave what you actually see into the conversation naturally; mention hazards first.
+- Treat the supplied on-device LiDAR, segmentation, and route facts as authoritative for distance and navigation. Never override a local stop instruction from the image alone.
 - Direction suggestions may come from an on-device walkable-path segmentation model or the LiDAR route planner — you can mention where a suggestion comes from casually ("the path model likes the left side").
 - You always receive live LiDAR context. When asked what's ahead, around, or how far something is — answer directly from the LiDAR sector distances, corridor reading, and alert state, even with no image. Convert meters to natural speech ("about a meter and a half ahead on your left").
 - If LiDAR shows a sector as unknown, say you can't read that side rather than guessing.
@@ -171,6 +170,38 @@ function lidarContextText(lidar) {
       .join(', ');
     lines.push(`- suggested direction from ${sourceLabel}: ${g.instruction}${extras ? ` (${extras})` : ''}`);
   }
+  if (lidar.route && typeof lidar.route.instruction === 'string') {
+    const route = lidar.route;
+    const details = [
+      route.status ? `status ${route.status}` : null,
+      typeof route.minimumClearanceM === 'number'
+        ? `clearance ${route.minimumClearanceM.toFixed(1)} m`
+        : null,
+      typeof route.openingWidthM === 'number'
+        ? `opening ${route.openingWidthM.toFixed(1)} m wide`
+        : null,
+      route.surfaceClass ? `surface ${route.surfaceClass}` : null,
+      route.source ? `source ${route.source}` : null,
+    ]
+      .filter(Boolean)
+      .join(', ');
+    lines.push(`- on-device route: ${route.instruction}${details ? ` (${details})` : ''}`);
+    if (Array.isArray(route.branches) && route.branches.length > 0) {
+      lines.push(
+        `- nearby path branches: ${route.branches
+          .slice(0, 3)
+          .map((branch) =>
+            branch &&
+            (branch.direction === 'left' || branch.direction === 'right') &&
+            typeof branch.distanceM === 'number'
+              ? `${branch.direction} in ${branch.distanceM.toFixed(1)} m`
+              : null,
+          )
+          .filter(Boolean)
+          .join(', ')}`,
+      );
+    }
+  }
   return lines.join('\n');
 }
 
@@ -244,13 +275,11 @@ function describeRequestBody({ imageBase64, mimeType, lidar }) {
   };
 }
 
-// Retry policy per Baseten's hackathon guidance: back off exponentially (with
-// jitter) on 429 rate limits and transient 5xx/network failures, honouring a
-// Retry-After header when present, and never retrying in a tight loop.
-// Streams are only retried before the first token has been forwarded to the
-// client (a replay after that would duplicate speech). Timeouts are never
-// retried — the pedestrian is waiting.
-const MAX_UPSTREAM_RETRIES = Math.max(0, Number(process.env.BASETEN_MAX_RETRIES ?? 2));
+// Retry transient Gemini failures with exponential backoff and jitter. Streams
+// are only retried before a token reaches the client so speech is never
+// duplicated. Timeouts are not retried because the pedestrian is waiting.
+// Honour Retry-After when present and never retry in a tight loop.
+const MAX_UPSTREAM_RETRIES = Math.max(0, Number(process.env.GEMINI_MAX_RETRIES ?? 2));
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -260,7 +289,13 @@ function retryDelayMs(attempt, retryAfterS) {
   return Math.round(base * (0.5 + Math.random() * 0.5)); // jitter so clients don't sync up
 }
 
-async function callBaseten(body, onDelta) {
+async function callGemini(body, onDelta) {
+  if (!CLOUD_AI_ENABLED) {
+    throw Object.assign(new Error('Cloud AI is disabled.'), { status: 503 });
+  }
+  if (!GEMINI_API_KEY) {
+    throw Object.assign(new Error('Gemini is not configured.'), { status: 503 });
+  }
   const streaming = typeof onDelta === 'function';
   let tokensSent = false;
   const guardedDelta = streaming
@@ -271,7 +306,7 @@ async function callBaseten(body, onDelta) {
     : null;
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await callBasetenOnce(body, guardedDelta);
+      return await callGeminiOnce(body, guardedDelta);
     } catch (error) {
       const transient =
         error.upstreamStatus === 429 ||
@@ -280,35 +315,93 @@ async function callBaseten(body, onDelta) {
       if (!transient || tokensSent || attempt >= MAX_UPSTREAM_RETRIES) throw error;
       const delay = retryDelayMs(attempt, error.retryAfterS);
       console.warn(
-        `[baseten] ${error.upstreamStatus ?? 'network error'} — retry ${attempt + 1}/${MAX_UPSTREAM_RETRIES} in ${delay}ms`,
+        `[gemini] ${error.upstreamStatus ?? 'network error'} — retry ${attempt + 1}/${MAX_UPSTREAM_RETRIES} in ${delay}ms`,
       );
       await sleep(delay);
     }
   }
 }
 
-// One Baseten call. When onDelta is given, streams SSE token deltas to it as
-// they arrive (Baseten supports `stream: true` on /v1/chat/completions); the
-// returned `content` is the full concatenated reply either way. onDelta lets
-// the proxy forward tokens to the client the moment they're generated, so the
-// pedestrian hears the first sentence ~1s in instead of waiting for the whole
-// reply.
-async function callBasetenOnce(body, onDelta) {
+function contentToGeminiParts(content) {
+  if (typeof content === 'string') return [{ text: content }];
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((part) => {
+    if (part?.type === 'text' && typeof part.text === 'string') {
+      return [{ text: part.text }];
+    }
+    if (part?.type === 'image_url' && typeof part.image_url?.url === 'string') {
+      const match = part.image_url.url.match(/^data:([^;]+);base64,(.+)$/s);
+      return match ? [{ inlineData: { mimeType: match[1], data: match[2] } }] : [];
+    }
+    if (part?.type === 'audio' && typeof part.data === 'string') {
+      return [{ inlineData: { mimeType: part.mimeType ?? 'audio/m4a', data: part.data } }];
+    }
+    return [];
+  });
+}
+
+function toGeminiRequest(body) {
+  const systemText = (body.messages ?? [])
+    .filter((message) => message.role === 'system')
+    .map((message) => String(message.content ?? ''))
+    .join('\n\n');
+  const contents = (body.messages ?? [])
+    .filter((message) => message.role === 'user' || message.role === 'assistant')
+    .map((message) => ({
+      role: message.role === 'assistant' ? 'model' : 'user',
+      parts: contentToGeminiParts(message.content),
+    }))
+    .filter((message) => message.parts.length > 0);
+  const schema = body.response_format?.json_schema?.schema;
+  return {
+    ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
+    contents,
+    generationConfig: {
+      temperature: body.temperature,
+      maxOutputTokens: body.max_tokens,
+      ...(schema ? { responseMimeType: 'application/json', responseSchema: schema } : {}),
+    },
+  };
+}
+
+function geminiText(data) {
+  return (data.candidates?.[0]?.content?.parts ?? [])
+    .map((part) => (typeof part.text === 'string' ? part.text : ''))
+    .join('');
+}
+
+function geminiUsage(data) {
+  const usage = data.usageMetadata;
+  return usage
+    ? {
+        prompt_tokens: usage.promptTokenCount,
+        completion_tokens: usage.candidatesTokenCount,
+        total_tokens: usage.totalTokenCount,
+      }
+    : null;
+}
+
+// Gemini supports regular JSON responses and SSE streaming from the same
+// generateContent payload. The proxy forwards text deltas immediately so
+// ElevenLabs can begin speaking the first complete sentence.
+async function callGeminiOnce(body, onDelta) {
   const streaming = typeof onDelta === 'function';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   const upstreamStart = Date.now();
   try {
+    const action = streaming ? 'streamGenerateContent?alt=sse' : 'generateContent';
+    const url = `${GEMINI_BASE_URL}/models/${encodeURIComponent(body.model)}:${action}`;
     let response;
     try {
-      response = await fetch(BASETEN_URL, {
+      response = await fetch(url, {
         method: 'POST',
         signal: controller.signal,
         headers: {
-          Authorization: `Bearer ${BASETEN_API_KEY}`,
           'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY,
         },
-        body: JSON.stringify({ ...body, stream: streaming }),
+        body: JSON.stringify(toGeminiRequest(body)),
       });
     } catch (error) {
       // Connection-level failure (DNS, reset, TLS) — retriable. Timeouts
@@ -320,7 +413,7 @@ async function callBasetenOnce(body, onDelta) {
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
       throw Object.assign(
-        new Error(`Baseten error ${response.status}: ${detail.slice(0, 300)}`),
+        new Error(`Gemini error ${response.status}: ${detail.slice(0, 300)}`),
         {
           status: response.status === 429 ? 429 : 502,
           upstreamStatus: response.status,
@@ -331,9 +424,9 @@ async function callBasetenOnce(body, onDelta) {
 
     if (!streaming) {
       const data = await response.json();
-      const content = data.choices?.[0]?.message?.content?.trim();
+      const content = geminiText(data).trim();
       if (!content) throw Object.assign(new Error('Empty model response.'), { status: 502 });
-      return { content, usage: data.usage ?? null, upstreamMs: Date.now() - upstreamStart };
+      return { content, usage: geminiUsage(data), upstreamMs: Date.now() - upstreamStart };
     }
 
     // Parse the SSE stream: `data: {json}\n\n`, terminated by `data: [DONE]`.
@@ -358,8 +451,8 @@ async function callBasetenOnce(body, onDelta) {
         } catch {
           continue;
         }
-        if (parsed.usage) usage = parsed.usage;
-        const delta = parsed.choices?.[0]?.delta?.content;
+        if (parsed.usageMetadata) usage = geminiUsage(parsed);
+        const delta = geminiText(parsed);
         if (delta) {
           full += delta;
           onDelta(delta);
@@ -375,11 +468,11 @@ async function callBasetenOnce(body, onDelta) {
 }
 
 async function companionChat(opts) {
-  const { content, usage, upstreamMs } = await callBaseten(companionRequestBody(opts), null);
+  const { content, usage, upstreamMs } = await callGemini(companionRequestBody(opts), null);
   return { reply: content, usage, upstreamMs };
 }
 
-// Structured hazard extraction — GLM-5.3-Flash with a strict JSON schema so
+// Structured hazard extraction with a strict JSON schema so
 // the app receives machine-readable hazards, not prose.
 const HAZARD_PROMPT = `You extract pedestrian hazards from one camera frame for a blind walker.
 Report only visually confirmable physical hazards in the walking space: obstacles, people, poles, steps, curbs, vehicles, hanging or low objects. Use the LiDAR context to set proximity when it corroborates. Do not report signs, colors, or scenery. Fewer, higher-confidence hazards beat many guesses. An empty list is a valid answer.`;
@@ -456,35 +549,83 @@ async function streamTts(res, text) {
   res.end();
 }
 
-// --- OpenAI ears: transcribe the user's raw audio ---------------------------
-async function transcribeAudio(audioBase64, audioMime) {
-  const form = new FormData();
-  const ext = audioMime.includes('wav') ? 'wav' : audioMime.includes('caf') ? 'caf' : 'm4a';
-  form.append(
-    'file',
-    new Blob([Buffer.from(audioBase64, 'base64')], { type: audioMime }),
-    `speech.${ext}`,
-  );
-  form.append('model', OPENAI_TRANSCRIBE_MODEL);
-  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: form,
-  });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => '');
-    throw Object.assign(new Error(`OpenAI ${response.status}: ${detail.slice(0, 200)}`), {
-      status: 502,
+// Gemini can hear the persisted push-to-talk audio and inspect the same single
+// camera frame in one request. The on-device transcript remains the fallback
+// when the recording format or network is unavailable.
+function understandRequestBody({
+  audioBase64,
+  audioMime,
+  history,
+  events,
+  imageBase64,
+  mimeType,
+  lidar,
+}) {
+  const eventsText = Array.isArray(events)
+    ? events
+        .slice(-6)
+        .map((event) => `- ${String(event).slice(0, 120)}`)
+        .join('\n')
+    : '';
+  const content = [
+    {
+      type: 'text',
+      text: `${lidarContextText(lidar)}${
+        eventsText ? `\nRecent journey moments:\n${eventsText}` : ''
+      }\n\nTranscribe the user's audio, then answer it as Path. Return only the requested JSON.`,
+    },
+    { type: 'audio', data: audioBase64, mimeType: audioMime },
+  ];
+  if (imageBase64) {
+    content.push({
+      type: 'image_url',
+      image_url: { url: `data:${mimeType};base64,${imageBase64}` },
     });
   }
-  const data = await response.json();
-  const transcript = (data.text ?? '').trim();
-  if (!transcript) throw Object.assign(new Error('Empty transcript.'), { status: 422 });
-  return transcript;
+  return {
+    model: imageBase64 ? FAST_VISION_MODEL : COMPANION_MODEL,
+    temperature: 0.35,
+    max_tokens: 220,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            transcript: { type: 'string' },
+            reply: { type: 'string' },
+          },
+          required: ['transcript', 'reply'],
+        },
+      },
+    },
+    messages: [
+      { role: 'system', content: COMPANION_PROMPT },
+      ...sanitizeHistory(history),
+      { role: 'user', content },
+    ],
+  };
+}
+
+async function understandAudioAndReply(opts) {
+  const { content, usage, upstreamMs } = await callGemini(understandRequestBody(opts), null);
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw Object.assign(new Error('Invalid Gemini audio response.'), { status: 502 });
+  }
+  const transcript = typeof parsed.transcript === 'string' ? parsed.transcript.trim() : '';
+  const reply = typeof parsed.reply === 'string' ? parsed.reply.trim() : '';
+  if (!transcript || !reply) {
+    throw Object.assign(new Error('Incomplete Gemini audio response.'), { status: 502 });
+  }
+  return { transcript, reply, usage, upstreamMs };
 }
 
 async function extractHazards(opts) {
-  const { content, usage, upstreamMs } = await callBaseten(hazardsRequestBody(opts), null);
+  const { content, usage, upstreamMs } = await callGemini(hazardsRequestBody(opts), null);
   let hazards = [];
   try {
     const parsed = JSON.parse(content);
@@ -496,13 +637,13 @@ async function extractHazards(opts) {
 }
 
 async function describeScene(opts) {
-  const { content, usage, upstreamMs } = await callBaseten(describeRequestBody(opts), null);
+  const { content, usage, upstreamMs } = await callGemini(describeRequestBody(opts), null);
   return { description: content, usage, upstreamMs };
 }
 
-// Streams a Baseten completion to the client as SSE: one `data: {"delta":...}`
+// Streams a Gemini completion to the client as SSE: one `data: {"delta":...}`
 // event per token, terminated by `data: [DONE]`. The proxy never buffers the
-// whole reply — each token is forwarded the instant Baseten emits it, which is
+// whole reply — each token is forwarded as Gemini emits it, which is
 // what lets on-device TTS start speaking the first sentence before the model
 // has finished generating the rest.
 async function streamReply(res, requestBody, started, label) {
@@ -516,7 +657,7 @@ async function streamReply(res, requestBody, started, label) {
     let upstreamMs;
     let retried = false;
     try {
-      ({ usage, upstreamMs } = await callBaseten(requestBody, (delta) => {
+      ({ usage, upstreamMs } = await callGemini(requestBody, (delta) => {
         res.write(`data: ${JSON.stringify({ delta })}\n\n`);
       }));
     } catch (error) {
@@ -526,7 +667,7 @@ async function streamReply(res, requestBody, started, label) {
       if (!/Empty model response/.test(error.message)) throw error;
       console.warn(`[${label}] empty stream — retrying buffered`);
       retried = true;
-      const retry = await callBaseten({ ...requestBody, max_tokens: 220 }, null);
+      const retry = await callGemini({ ...requestBody, max_tokens: 220 }, null);
       res.write(`data: ${JSON.stringify({ delta: retry.content })}\n\n`);
       ({ usage, upstreamMs } = retry);
     }
@@ -539,7 +680,7 @@ async function streamReply(res, requestBody, started, label) {
   } catch (error) {
     // Match the non-streaming path: send a generic message to the client and
     // keep the raw upstream detail server-side only (error.message can contain
-    // the full Baseten response body, which we must not leak to the app).
+    // the full Gemini response body, which we must not leak to the app).
     res.write(`data: ${JSON.stringify({ error: 'Request failed.' })}\n\n`);
     res.end();
     console.error(`[${label}] stream fail ${Date.now() - started}ms: ${error.message}`);
@@ -553,13 +694,17 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     return send(res, 200, {
       ok: true,
+      provider: 'gemini',
+      cloudAi: CLOUD_AI_ENABLED && Boolean(GEMINI_API_KEY),
+      ai: CLOUD_AI_ENABLED && Boolean(GEMINI_API_KEY),
       model: MODEL,
       companionModel: COMPANION_MODEL,
-      tts: Boolean(ELEVENLABS_API_KEY),
-      understand: Boolean(OPENAI_API_KEY),
+      tts: CLOUD_AI_ENABLED && Boolean(ELEVENLABS_API_KEY),
+      understand: CLOUD_AI_ENABLED && Boolean(GEMINI_API_KEY),
     });
   }
   if (req.method === 'GET' && req.url?.startsWith('/tts?')) {
+    if (!CLOUD_AI_ENABLED) return send(res, 503, { error: 'Cloud AI is disabled.' });
     if (!ELEVENLABS_API_KEY) return send(res, 503, { error: 'TTS not configured.' });
     if (rateLimited(ip)) return send(res, 429, { error: 'Too many requests.' });
     const params = new URL(req.url, 'http://localhost').searchParams;
@@ -600,21 +745,22 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.url === '/understand') {
-      if (!OPENAI_API_KEY) return send(res, 503, { error: 'Understand not configured.' });
+      if (!CLOUD_AI_ENABLED) return send(res, 503, { error: 'Cloud AI is disabled.' });
+      if (!GEMINI_API_KEY) return send(res, 503, { error: 'Understand not configured.' });
       const { audioBase64, audioMime = 'audio/m4a', history, events } = body ?? {};
       if (typeof audioBase64 !== 'string' || audioBase64.length < 100) {
         return send(res, 400, { error: 'audioBase64 is required.' });
       }
-      const transcript = await transcribeAudio(audioBase64, audioMime);
-      console.log(`[understand] transcript (${transcript.length} chars) via ${OPENAI_TRANSCRIBE_MODEL}`);
-      const { reply, usage, upstreamMs } = await companionChat({
-        text: transcript.slice(0, 1000),
+      const { transcript, reply, usage, upstreamMs } = await understandAudioAndReply({
+        audioBase64,
+        audioMime,
         history,
         events,
         imageBase64: typeof imageBase64 === 'string' ? imageBase64 : null,
         mimeType,
         lidar,
       });
+      console.log(`[understand] transcript (${transcript.length} chars) via ${COMPANION_MODEL}`);
       const totalMs = Date.now() - started;
       console.log(
         `[understand] ok total=${totalMs}ms brain=${upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
@@ -679,32 +825,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Pre-open the TLS connection to Baseten so the first real request skips the
-// handshake (~300ms). Keep-alive in Node's fetch pool reuses it afterwards.
-async function warmUpstream() {
-  try {
-    const started = Date.now();
-    await fetch(BASETEN_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${BASETEN_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: FAST_VISION_MODEL,
-        max_tokens: 1,
-        messages: [{ role: 'user', content: 'hi' }],
-      }),
-    });
-    console.log(`[warmup] Baseten connection ready in ${Date.now() - started}ms`);
-  } catch (error) {
-    console.warn(`[warmup] failed (non-fatal): ${error.message}`);
-  }
-}
-
 server.listen(PORT, () => {
   console.log(
-    `PathFinder scene proxy listening on http://0.0.0.0:${PORT} (describe: ${MODEL}, chat: ${COMPANION_MODEL}, vision: ${FAST_VISION_MODEL})`,
+    `PathFinder scene proxy listening on http://0.0.0.0:${PORT} (provider: Gemini, describe: ${MODEL}, chat: ${COMPANION_MODEL}, vision: ${FAST_VISION_MODEL})`,
   );
-  void warmUpstream();
 });

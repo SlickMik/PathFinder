@@ -12,6 +12,7 @@ import type { describeCurrentScene as DescribeScene } from '../features/speech/s
 // Must be set before sceneDescriber.ts is evaluated (it reads SCENE_URL at
 // module load).
 process.env.EXPO_PUBLIC_SCENE_DESCRIBE_URL = 'http://test.local/describe-scene';
+process.env.EXPO_PUBLIC_CLOUD_AI_ENABLED = 'true';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const lidarModule = require('../modules/expo-lidar-vision') as {

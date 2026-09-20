@@ -64,7 +64,7 @@ export function useVoiceInput(
   const onEndRef = useRef(options.onEnd);
   onEndRef.current = options.onEnd;
 
-  // The recognizer persists the raw audio so the backend's GPT ears can hear
+  // The recognizer persists raw audio so Gemini can hear
   // the original speech — more robust than the on-device transcript in noise.
   useEventListener(speechEvents, 'audioend', (event) => {
     audioUriRef.current = event.uri ?? null;
@@ -128,7 +128,7 @@ export function useVoiceInput(
         interimResults: true,
         continuous: false,
         requiresOnDeviceRecognition: false,
-        // Keep the raw audio so the backend can transcribe with GPT (better
+        // Keep raw audio so Gemini can transcribe it when available (better
         // in noise/accents); the local transcript remains the fallback.
         recordingOptions: { persist: true },
         iosCategory: {

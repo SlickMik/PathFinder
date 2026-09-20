@@ -63,38 +63,51 @@ MIT license are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 For a shared device build, configure Apple signing and run `eas build --profile development
 --platform ios`.
 
-## AI companion backend (Baseten)
+## AI companion backend (Gemini + ElevenLabs)
 
 Deterministic LiDAR collision alerts run entirely on-device and never wait on the network. On
-top of them, an optional zero-dependency Node proxy (`server/index.mjs`, Node 18+) powers the
-spoken AI features through [Baseten Model APIs](https://docs.baseten.co/inference/model-apis/overview):
+top of them, an optional zero-dependency Node proxy (`server/index.mjs`, Node 18+) uses Gemini
+for multimodal understanding and ElevenLabs for natural voice output:
 
-- `POST /describe-scene` — on-request scene descriptions from a vision model
-  (`zai-org/GLM-5.3-Flash` by default), grounded in compact LiDAR context
+- `POST /describe-scene` — on-request Gemini scene descriptions grounded in compact on-device
+  LiDAR, segmentation, and route context
 - `POST /hazards` — structured hazard extraction with a strict JSON schema
 - `POST /companion` — the "Path" walking companion, token-streamed over SSE so speech starts
   before the model finishes generating
-- `POST /understand` — raw-audio understanding (OpenAI transcription; the reply brain stays
-  Baseten) — optional
+- `POST /understand` — Gemini raw-audio transcription and multimodal reply — optional
 - `GET /tts` — ElevenLabs natural voice — optional
 
-The Baseten API key lives only on the server. The app sends a single deliberately captured
-frame plus compact LiDAR sector distances — never a continuous video feed or the raw depth map.
+The Gemini API key lives only on the server. The app answers reliable distance, direction, and
+surface questions from on-device sensors first. Semantic questions send one deliberately captured
+frame plus compact LiDAR/route facts — never a continuous video feed, segmentation mask, or raw
+depth map. If Gemini is unavailable, scene requests fall back to a concise local sensor summary.
 Upstream 429/5xx and connection failures are retried with exponential backoff and jitter
 (honouring `Retry-After`); streamed replies are only retried before the first token reaches the
 client.
 
+Cloud AI is opt-in while this path is being stabilized. Leave `CLOUD_AI_ENABLED=false` in
+`server/.env` (the default) for local-only navigation: no Gemini, ElevenLabs, camera upload, or
+cloud companion request is made. Set `CLOUD_AI_ENABLED=true` and restart the development
+supervisor to enable the Gemini and ElevenLabs routes; the supervisor passes the matching
+`EXPO_PUBLIC_CLOUD_AI_ENABLED` flag to Expo automatically.
+
 ```sh
-cp server/.env.example server/.env   # set BASETEN_API_KEY
-node server/index.mjs                # listens on :8787
+cp server/.env.example server/.env   # set GEMINI_API_KEY and optional voice keys
+npm start                            # proxy + Metro, with the LAN URL injected automatically
+npm run ios -- --device              # proxy + native build, also automatic
 node server/e2e-test.mjs             # optional end-to-end check
 ```
 
-Point the app at the proxy (device and Mac on the same network):
+The development launcher detects the Mac's current LAN address, starts the proxy on port 8787,
+waits for `/health`, and injects `EXPO_PUBLIC_SCENE_DESCRIBE_URL` into Expo. The device and Mac
+must be on the same network. Set `PATHFINDER_PROXY_HOST=127.0.0.1` to force Simulator routing,
+or put an explicit `EXPO_PUBLIC_SCENE_DESCRIBE_URL` in the root `.env` to override detection.
+Use `npm run start:expo` or `npm run ios:expo` only when you intentionally want Expo without the
+proxy supervisor.
 
-```sh
-EXPO_PUBLIC_SCENE_DESCRIBE_URL=http://<your-mac-ip>:8787/describe-scene npx expo run:ios --device
-```
+In a development client launched directly by Expo, the app can also derive the proxy host from
+Metro at runtime. The proxy still needs to be running separately (`npm run server`), so the
+supervised `npm start` / `npm run ios -- --device` commands remain the simplest path.
 
 `EXPO_PUBLIC_COMPANION_URL` and `EXPO_PUBLIC_SCENE_APP_SECRET` are optional overrides; the
 companion, hazard, and understand URLs are otherwise derived from the scene URL. Without a

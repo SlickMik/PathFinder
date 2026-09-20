@@ -1,5 +1,5 @@
 #!/bin/bash
-# Keeps the PathFinder backend alive: restarts the Baseten proxy (8787) and
+# Keeps the PathFinder backend alive: restarts the Gemini proxy (8787) and
 # Metro (8082) if either stops responding. Run: bash server/watchdog.sh &
 cd "$(dirname "$0")/.." || exit 1
 export TEC_NPM_BIN_DIR="${TEC_NPM_BIN_DIR:-/nix/store/m3wj2l4bir43rj1swgjic7k6w8ppjm97-nodejs-24.15.0/bin}"
