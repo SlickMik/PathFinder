@@ -4,7 +4,8 @@ import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
-import { companionSay, resetCompanion } from '../speech/companion';
+import { companionSay, resetCompanion, understandAudio } from '../speech/companion';
+import { readAsStringAsync } from 'expo-file-system/legacy';
 import { describeCurrentScene, fetchSceneHazards } from '../speech/sceneDescriber';
 import type { SceneHazard } from '../speech/sceneDescriber';
 import { speak, speakStream, stopSpeaking } from '../speech/speech';
@@ -418,7 +419,7 @@ export function useLidarScanner() {
     }
   }, [active, announce]);
   const askCompanion = useCallback(
-    async (text: string) => {
+    async (text: string, audioUri: string | null = null) => {
       console.log(`[companion] user said: "${text}"`);
       try {
         // The user spoke — cut off any ongoing narration immediately.
@@ -427,6 +428,21 @@ export function useLidarScanner() {
         const recentEvents = journeyEventsRef.current
           .filter((entry) => now - entry.at < 90_000)
           .map((entry) => `${Math.round((now - entry.at) / 1000)}s ago: ${entry.event}`);
+
+        // GPT ears: when the raw audio was persisted and the backend has
+        // OpenAI configured, send the audio itself — GPT hears the original
+        // speech (noise, accents, mumbles) instead of trusting on-device STT.
+        if (audioUri) {
+          const understood = await tryUnderstandAudio(audioUri, recentEvents);
+          if (understood) {
+            console.log(`[companion] GPT heard: "${understood.transcript}"`);
+            console.log(`[companion] reply: "${understood.reply}"`);
+            const speech = speakStream(() => alertRef.current.risk !== 'critical');
+            speech.push(understood.reply);
+            await speech.done();
+            return;
+          }
+        }
         // Stream the reply into incremental TTS: the first sentence starts
         // speaking ~1s after the user stops talking, while the model is still
         // generating the rest. The guard yields to a critical local obstacle
@@ -450,6 +466,28 @@ export function useLidarScanner() {
       }
     },
     [active, announce],
+  );
+
+  const tryUnderstandAudio = useCallback(
+    async (audioUri: string, recentEvents: string[]) => {
+      try {
+        const audioBase64 = await readAsStringAsync(audioUri, { encoding: 'base64' });
+        const extension = audioUri.split('.').pop()?.toLowerCase() ?? 'caf';
+        const audioMime =
+          extension === 'wav' ? 'audio/wav' : extension === 'caf' ? 'audio/x-caf' : 'audio/m4a';
+        return await understandAudio(audioBase64, audioMime, {
+          snapshot: snapshotRef.current,
+          alert: alertRef.current,
+          guidance: guidanceRef.current,
+          events: recentEvents,
+          withFrame: active,
+        });
+      } catch (error) {
+        console.warn('[companion] audio read failed, using local transcript:', error);
+        return null;
+      }
+    },
+    [active],
   );
 
   const toggleAlertVoice = useCallback(() => {

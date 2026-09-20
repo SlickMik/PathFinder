@@ -13,16 +13,24 @@ type VoiceInputOptions = {
 };
 
 export function useVoiceInput(
-  onTranscript: (text: string) => void,
+  onTranscript: (text: string, audioUri?: string | null) => void,
   options: VoiceInputOptions = {},
 ) {
   const [listening, setListening] = useState(false);
   const listeningRef = useRef(false);
   const transcriptRef = useRef('');
+  const audioUriRef = useRef<string | null>(null);
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
   const onEndRef = useRef(options.onEnd);
   onEndRef.current = options.onEnd;
+
+  // The recognizer persists the raw audio so the backend's GPT ears can hear
+  // the original speech — more robust than the on-device transcript in noise.
+  useSpeechRecognitionEvent('audioend', (event) => {
+    audioUriRef.current = event.uri ?? null;
+    console.log(`[voice] audio persisted: ${event.uri ? 'yes' : 'no'}`);
+  });
 
   useSpeechRecognitionEvent('start', () => {
     console.log('[voice] recognition started');
@@ -38,14 +46,16 @@ export function useVoiceInput(
 
   useSpeechRecognitionEvent('end', () => {
     const text = transcriptRef.current.trim();
+    const audioUri = audioUriRef.current;
     console.log(`[voice] recognition ended, transcript: "${text}"`);
     listeningRef.current = false;
     setListening(false);
     transcriptRef.current = '';
+    audioUriRef.current = null;
     // Recognition switched the audio session to record mode — restore
     // playback mode or replies may go quiet / route to the earpiece.
     void reapplyAudioMode();
-    if (text) onTranscriptRef.current(text);
+    if (text) onTranscriptRef.current(text, audioUri);
     onEndRef.current?.(Boolean(text));
   });
 
@@ -75,6 +85,9 @@ export function useVoiceInput(
         interimResults: true,
         continuous: false,
         requiresOnDeviceRecognition: false,
+        // Keep the raw audio so the backend can transcribe with GPT (better
+        // in noise/accents); the local transcript remains the fallback.
+        recordingOptions: { persist: true },
         iosCategory: {
           category: 'playAndRecord',
           categoryOptions: ['defaultToSpeaker', 'allowBluetooth'],

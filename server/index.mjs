@@ -39,6 +39,14 @@ const COMPANION_MODEL = process.env.BASETEN_COMPANION_MODEL ?? 'moonshotai/Kimi-
 // Fastest vision-capable GPU model on Baseten — used for any turn that
 // carries a camera frame so replies come back quicker.
 const FAST_VISION_MODEL = process.env.BASETEN_FAST_VISION_MODEL ?? 'zai-org/GLM-5.3-Flash';
+// Optional integrations — the app degrades gracefully when these are absent.
+// ElevenLabs: natural voice out. OpenAI: understands the user's raw audio
+// (better than on-device STT in noise/accents); the reply brain stays Baseten.
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? '21m00Tcm4TlvDq8ikWAM'; // Rachel
+const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_turbo_v2_5';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
+const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe';
 const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
 const BASETEN_URL = 'https://inference.baseten.co/v1/chat/completions';
 
@@ -364,6 +372,58 @@ function hazardsRequestBody({ imageBase64, mimeType, lidar }) {
   };
 }
 
+// --- ElevenLabs TTS: stream mp3 for one sentence/utterance ------------------
+async function streamTts(res, text) {
+  const upstream = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=mp3_44100_64`,
+    {
+      method: 'POST',
+      headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text,
+        model_id: ELEVENLABS_MODEL,
+        voice_settings: { stability: 0.45, similarity_boost: 0.7 },
+      }),
+    },
+  );
+  if (!upstream.ok) {
+    const detail = await upstream.text().catch(() => '');
+    throw Object.assign(new Error(`ElevenLabs ${upstream.status}: ${detail.slice(0, 200)}`), {
+      status: 502,
+    });
+  }
+  res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' });
+  for await (const chunk of upstream.body) res.write(chunk);
+  res.end();
+}
+
+// --- OpenAI ears: transcribe the user's raw audio ---------------------------
+async function transcribeAudio(audioBase64, audioMime) {
+  const form = new FormData();
+  const ext = audioMime.includes('wav') ? 'wav' : audioMime.includes('caf') ? 'caf' : 'm4a';
+  form.append(
+    'file',
+    new Blob([Buffer.from(audioBase64, 'base64')], { type: audioMime }),
+    `speech.${ext}`,
+  );
+  form.append('model', OPENAI_TRANSCRIBE_MODEL);
+  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: form,
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw Object.assign(new Error(`OpenAI ${response.status}: ${detail.slice(0, 200)}`), {
+      status: 502,
+    });
+  }
+  const data = await response.json();
+  const transcript = (data.text ?? '').trim();
+  if (!transcript) throw Object.assign(new Error('Empty transcript.'), { status: 422 });
+  return transcript;
+}
+
 async function extractHazards(opts) {
   const { content, usage, upstreamMs } = await callBaseten(hazardsRequestBody(opts), null);
   let hazards = [];
@@ -417,9 +477,38 @@ const server = http.createServer(async (req, res) => {
   const ip = req.socket.remoteAddress ?? 'unknown';
 
   if (req.method === 'GET' && req.url === '/health') {
-    return send(res, 200, { ok: true, model: MODEL, companionModel: COMPANION_MODEL });
+    return send(res, 200, {
+      ok: true,
+      model: MODEL,
+      companionModel: COMPANION_MODEL,
+      tts: Boolean(ELEVENLABS_API_KEY),
+      understand: Boolean(OPENAI_API_KEY),
+    });
   }
-  if (req.method !== 'POST' || !['/describe-scene', '/companion', '/hazards'].includes(req.url)) {
+  if (req.method === 'GET' && req.url?.startsWith('/tts?')) {
+    if (!ELEVENLABS_API_KEY) return send(res, 503, { error: 'TTS not configured.' });
+    if (rateLimited(ip)) return send(res, 429, { error: 'Too many requests.' });
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const text = (params.get('text') ?? '').slice(0, 600).trim();
+    if (SHARED_SECRET && params.get('secret') !== SHARED_SECRET) {
+      return send(res, 401, { error: 'Unauthorized.' });
+    }
+    if (!text) return send(res, 400, { error: 'text is required.' });
+    try {
+      const ttsStarted = Date.now();
+      await streamTts(res, text);
+      console.log(`[tts] ok ${Date.now() - ttsStarted}ms chars=${text.length}`);
+    } catch (error) {
+      console.error(`[tts] fail: ${error.message}`);
+      if (!res.headersSent) send(res, error.status ?? 500, { error: 'TTS failed.' });
+      else res.end();
+    }
+    return;
+  }
+  if (
+    req.method !== 'POST' ||
+    !['/describe-scene', '/companion', '/hazards', '/understand'].includes(req.url)
+  ) {
     return send(res, 404, { error: 'Not found.' });
   }
   if (SHARED_SECRET && req.headers['x-app-secret'] !== SHARED_SECRET) {
@@ -434,6 +523,29 @@ const server = http.createServer(async (req, res) => {
     const { imageBase64, mimeType = 'image/jpeg', lidar } = body ?? {};
     if (imageBase64 !== undefined && !['image/jpeg', 'image/png'].includes(mimeType)) {
       return send(res, 400, { error: 'Unsupported mimeType.' });
+    }
+
+    if (req.url === '/understand') {
+      if (!OPENAI_API_KEY) return send(res, 503, { error: 'Understand not configured.' });
+      const { audioBase64, audioMime = 'audio/m4a', history, events } = body ?? {};
+      if (typeof audioBase64 !== 'string' || audioBase64.length < 100) {
+        return send(res, 400, { error: 'audioBase64 is required.' });
+      }
+      const transcript = await transcribeAudio(audioBase64, audioMime);
+      console.log(`[understand] transcript (${transcript.length} chars) via ${OPENAI_TRANSCRIBE_MODEL}`);
+      const { reply, usage, upstreamMs } = await companionChat({
+        text: transcript.slice(0, 1000),
+        history,
+        events,
+        imageBase64: typeof imageBase64 === 'string' ? imageBase64 : null,
+        mimeType,
+        lidar,
+      });
+      const totalMs = Date.now() - started;
+      console.log(
+        `[understand] ok total=${totalMs}ms brain=${upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+      );
+      return send(res, 200, { transcript, reply });
     }
 
     if (req.url === '/companion') {

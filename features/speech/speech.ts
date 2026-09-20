@@ -1,5 +1,6 @@
 import { setAudioModeAsync } from 'expo-audio';
 import * as Speech from 'expo-speech';
+import { naturalSpeak, naturalVoiceAvailable, stopNatural } from './naturalVoice';
 import { splitSentences } from './sentenceSplit';
 
 let audioReady: Promise<void> | null = null;
@@ -56,6 +57,14 @@ export function speak(text: string, critical = false): Promise<void> {
   return new Promise((resolve) => {
     void (async () => {
       await ensureAudioMode();
+      // Non-critical speech prefers the ElevenLabs natural voice when the
+      // backend has it configured. Critical alerts ALWAYS use on-device TTS:
+      // a safety warning must never wait on a network round-trip.
+      if (!critical && (await naturalVoiceAvailable())) {
+        await naturalSpeak(text);
+        resolve();
+        return;
+      }
       if (preferredVoice === undefined) preferredVoice = await resolveVoice();
       // Critical alerts cut off whatever is being read; others queue behind it.
       if (critical) await Speech.stop();
@@ -115,11 +124,21 @@ export function speakStream(guard?: () => boolean): SpeakStream {
     if (finished && ready && waiting.length === 0 && pending <= 0) resolveDone();
   };
 
+  let useNatural = false;
+
   const enqueue = (text: string) => {
     const sentence = text.trim();
     if (!sentence) return;
     if (guard && !guard()) return;
     pending += 1;
+    if (useNatural) {
+      // ElevenLabs queue keeps sentence order; resolves when playback ends.
+      void naturalSpeak(sentence).then(() => {
+        pending -= 1;
+        checkEnd();
+      });
+      return;
+    }
     Speech.speak(sentence, {
       rate: 0.98,
       pitch: 1.0,
@@ -145,6 +164,7 @@ export function speakStream(guard?: () => boolean): SpeakStream {
     // then the memoized voice lookup.
     await ensureAudioMode();
     await ensureVoiceResolved();
+    useNatural = await naturalVoiceAvailable();
     ready = true;
     for (const s of waiting) enqueue(s);
     waiting.length = 0;
@@ -177,5 +197,6 @@ export function speakStream(guard?: () => boolean): SpeakStream {
 }
 
 export function stopSpeaking(): Promise<void> {
+  stopNatural();
   return Speech.stop();
 }
