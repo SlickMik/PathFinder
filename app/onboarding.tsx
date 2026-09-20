@@ -241,8 +241,10 @@ const styles = StyleSheet.create({
   dots: {
     flexDirection: 'row',
     justifyContent: 'center',
-    gap: 8,
-    paddingVertical: 10,
+    alignItems: 'center',
+    gap: 10,
+    paddingTop: 14,
+    paddingBottom: 24,
   },
   dot: {
     width: 8,
