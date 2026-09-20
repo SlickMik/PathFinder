@@ -25,6 +25,33 @@ export type LidarSupport = {
   reason?: 'no-lidar' | 'unsupported-os' | 'permission-denied';
 };
 
+export type GroundHazardKind = 'drop-off' | 'trip-hazard';
+
+export type DropOffReading = {
+  detected: boolean;
+  /** Forward distance to the nearest below-floor evidence, in metres. */
+  distanceM: number | null;
+  /** Observed depth below the detected floor, in metres. */
+  depthM: number | null;
+  sampleCount: number;
+};
+
+export type TripHazardReading = {
+  detected: boolean;
+  /** Forward distance to the nearest low obstacle, in metres. */
+  distanceM: number | null;
+  /** Observed height of the low obstacle above the floor, in metres. */
+  heightM: number | null;
+  sampleCount: number;
+};
+
+export type GroundHazards = {
+  /** Hazard readings are only trustworthy once ARKit has classified a floor. */
+  floorDetected: boolean;
+  dropOff: DropOffReading;
+  tripHazard: TripHazardReading;
+};
+
 export type SectorReading = {
   distanceM: number | null;
   confidence: Confidence;
@@ -47,6 +74,8 @@ export type ObstacleSnapshot = {
     coverage: number;
     risk: Risk;
   };
+  /** Ground-level hazards: drop-offs (stairs down, ditches) and trip hazards. */
+  hazards?: GroundHazards;
   route?: {
     instruction: NavigationInstruction;
     status: 'clear' | 'narrow' | 'blocked' | 'unknown';
@@ -131,6 +160,18 @@ export type AlertState = {
   direction: Sector | null;
   saferFrameCount: number;
   unknownFrameCount: number;
+  announcement: string | null;
+};
+
+export type GroundHazardAlertState = {
+  active: GroundHazardKind | null;
+  /** Latest forward distance to the active hazard, in metres. */
+  distanceM: number | null;
+  dropOffFrameCount: number;
+  tripFrameCount: number;
+  clearFrameCount: number;
+  /** Phrase spoken the last time this hazard was announced. */
+  lastSpokenPhrase: string | null;
   announcement: string | null;
 };
 

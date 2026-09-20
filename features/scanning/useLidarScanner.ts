@@ -4,6 +4,12 @@ import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
+import {
+  INITIAL_GROUND_HAZARD_STATE,
+  escalateRisk,
+  groundHazardRisk,
+  reduceGroundHazardState,
+} from './groundHazards';
 import { describeCurrentScene } from '../speech/sceneDescriber';
 import { speak, stopSpeaking } from '../speech/speech';
 import { emitRiskHaptic, hapticIntervalMs } from './haptics';
@@ -16,6 +22,7 @@ import {
 } from './navigation';
 import type {
   AlertState,
+  GroundHazardAlertState,
   LidarSupport,
   LiveDebugFrame,
   NavigationGuidance,
@@ -35,6 +42,9 @@ export function useLidarScanner() {
   const [active, setActive] = useState(false);
   const [snapshot, setSnapshot] = useState<ObstacleSnapshot | null>(null);
   const [alert, setAlert] = useState<AlertState>(INITIAL_ALERT_STATE);
+  const [groundHazard, setGroundHazard] = useState<GroundHazardAlertState>(
+    INITIAL_GROUND_HAZARD_STATE,
+  );
   const [guidance, setGuidance] = useState<NavigationGuidance>(
     INITIAL_NAVIGATION_GUIDANCE,
   );
@@ -43,6 +53,7 @@ export function useLidarScanner() {
   const [liveDebugFrame, setLiveDebugFrame] = useState<LiveDebugFrame | null>(null);
   const [liveDebugError, setLiveDebugError] = useState<string | null>(null);
   const alertRef = useRef(INITIAL_ALERT_STATE);
+  const groundHazardRef = useRef(INITIAL_GROUND_HAZARD_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({
@@ -133,6 +144,13 @@ export function useLidarScanner() {
       alertRef.current = nextAlert;
       setAlert(nextAlert);
 
+      const nextGroundHazard = reduceGroundHazardState(
+        groundHazardRef.current,
+        nextSnapshot,
+      );
+      groundHazardRef.current = nextGroundHazard;
+      setGroundHazard(nextGroundHazard);
+
       const previousGuidance = guidanceRef.current;
       const nextGuidance = reduceNavigationGuidance(
         previousGuidance,
@@ -150,11 +168,22 @@ export function useLidarScanner() {
       if (nextAlert.announcement) {
         announce(nextAlert.announcement, nextAlert.risk === 'critical');
       }
+
+      // Ground hazards interrupt regular obstacle chatter: a missed drop-off
+      // is worse than a repeated obstacle warning.
+      if (nextGroundHazard.announcement) {
+        announce(
+          nextGroundHazard.announcement,
+          groundHazardRisk(nextGroundHazard) === 'critical',
+        );
+      }
     });
 
     const errorSubscription = ExpoLidarVision.onError((error) => {
       alertRef.current = INITIAL_ALERT_STATE;
       setAlert(INITIAL_ALERT_STATE);
+      groundHazardRef.current = INITIAL_GROUND_HAZARD_STATE;
+      setGroundHazard(INITIAL_GROUND_HAZARD_STATE);
       guidanceRef.current = INITIAL_NAVIGATION_GUIDANCE;
       setGuidance(INITIAL_NAVIGATION_GUIDANCE);
       setSafetyEnvelope(INITIAL_SAFETY_ENVELOPE);
@@ -180,6 +209,8 @@ export function useLidarScanner() {
     setSnapshot(null);
     alertRef.current = INITIAL_ALERT_STATE;
     setAlert(INITIAL_ALERT_STATE);
+    groundHazardRef.current = INITIAL_GROUND_HAZARD_STATE;
+    setGroundHazard(INITIAL_GROUND_HAZARD_STATE);
     guidanceRef.current = INITIAL_NAVIGATION_GUIDANCE;
     setGuidance(INITIAL_NAVIGATION_GUIDANCE);
     setSafetyEnvelope(INITIAL_SAFETY_ENVELOPE);
@@ -203,15 +234,28 @@ export function useLidarScanner() {
     return () => subscription.remove();
   }, [active, stop]);
 
+  // Ground hazards escalate the haptic pattern even when the corridor is
+  // otherwise clear (a drop-off produces no forward obstacle return).
+  const hazardRiskLevel = groundHazardRisk(groundHazard);
   useEffect(() => {
     if (!active) return;
-    const intervalMs = hapticIntervalMs(alert.risk);
+    const effectiveRisk = escalateRisk(alert.risk, hazardRiskLevel);
+    const intervalMs = hapticIntervalMs(effectiveRisk);
     if (intervalMs === null) return;
 
-    void emitRiskHaptic(alert.risk);
-    const timer = setInterval(() => void emitRiskHaptic(alertRef.current.risk), intervalMs);
+    void emitRiskHaptic(effectiveRisk);
+    const timer = setInterval(
+      () =>
+        void emitRiskHaptic(
+          escalateRisk(
+            alertRef.current.risk,
+            groundHazardRisk(groundHazardRef.current),
+          ),
+        ),
+      intervalMs,
+    );
     return () => clearInterval(timer);
-  }, [active, alert.risk]);
+  }, [active, alert.risk, hazardRiskLevel]);
 
   useEffect(() => {
     if (!active) {
@@ -302,6 +346,7 @@ export function useLidarScanner() {
     describeScene,
     alert,
     errorMessage,
+    groundHazard,
     guidance,
     liveDebugError,
     liveDebugFrame,

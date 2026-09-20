@@ -23,6 +23,10 @@ final class DepthProcessor {
   }
 
   private var obstacleMap: [VoxelKey: MapPoint] = [:]
+  /// World-locked evidence of surfaces measured well below the detected floor
+  /// (descending stairs, ditches, kerb drops). Kept separate from the obstacle
+  /// map because these points must never be treated as walkable free space.
+  private var dropOffMap: [VoxelKey: MapPoint] = [:]
   private var corridorHistory: [DistanceSample] = []
   private let routePlanner = LocalRoutePlanner()
   private let personSegmenter = PersonSegmenter()
@@ -30,9 +34,23 @@ final class DepthProcessor {
   private let voxelSize: Float = 0.1
   private let mapLifetime: TimeInterval = 0.45
   private let sampleStride = 3
+  /// Drop-off evidence persists slightly longer than the obstacle map because
+  /// below-floor returns are sparse and the alert must survive brief gaps.
+  private let dropOffLifetime: TimeInterval = 0.7
+  /// A surface must sit at least this far below the detected floor before it
+  /// counts as drop-off evidence. Keeps ordinary floor noise out of the alert.
+  private let dropOffDepthM: Float = 0.22
+  /// Ground hazards are only evaluated in the near field where LiDAR returns
+  /// from thin, low objects are still dense enough to trust.
+  private let hazardRangeM: Float = 4.0
+  /// Low band that catches wires, cords, kerbs, and toys: above the floor
+  /// tolerance (0.08 m) but below anything the sector alerts describe well.
+  private let tripBandMinM: Float = 0.08
+  private let tripBandMaxM: Float = 0.32
 
   func reset() {
     obstacleMap.removeAll(keepingCapacity: true)
+    dropOffMap.removeAll(keepingCapacity: true)
     corridorHistory.removeAll(keepingCapacity: true)
     routePlanner.reset()
     personSegmenter.reset()
@@ -64,7 +82,26 @@ final class DepthProcessor {
         "coverage": 0,
         "risk": "unknown"
       ],
-      "route": routePlanner.unknown()
+      "route": routePlanner.unknown(),
+      "hazards": unknownHazards()
+    ]
+  }
+
+  private func unknownHazards(floorDetected: Bool = false) -> Payload {
+    [
+      "floorDetected": floorDetected,
+      "dropOff": [
+        "detected": false,
+        "distanceM": NSNull(),
+        "depthM": NSNull(),
+        "sampleCount": 0
+      ],
+      "tripHazard": [
+        "detected": false,
+        "distanceM": NSNull(),
+        "heightM": NSNull(),
+        "sampleCount": 0
+      ]
     ]
   }
 
@@ -205,6 +242,24 @@ final class DepthProcessor {
           worldPoint.y > $0 + 0.08 && worldPoint.y < $0 + 2.0
         } ?? (relativeHeight > -1.30 && relativeHeight < 0.5)
         let isRouteObstacle = isPerson || (!onDetectedFloor && withinBodyHeight)
+
+        // Below-floor returns inside the walking corridor are direct evidence
+        // of a descending stair, ditch, or hole. Only high-confidence samples
+        // qualify because glossy floors can mirror phantom points below grade.
+        if let floorHeight,
+           confidence >= 2,
+           !isPerson,
+           forwardDistance <= hazardRangeM,
+           abs(lateralDistance) <= Float(options.corridorWidthM / 2),
+           worldPoint.y < floorHeight - dropOffDepthM {
+          let key = VoxelKey(
+            x: Int(floor(worldPoint.x / voxelSize)),
+            y: Int(floor(worldPoint.y / voxelSize)),
+            z: Int(floor(worldPoint.z / voxelSize))
+          )
+          dropOffMap[key] = MapPoint(position: worldPoint, confidence: confidence, updatedAt: now)
+        }
+
         // Ceiling returns must not carve a free route underneath their rays.
         guard onDetectedFloor || isRouteObstacle else { continue }
         if ((pixelX / sampleStride) + (pixelY / sampleStride)).isMultiple(of: 2) {
@@ -239,6 +294,9 @@ final class DepthProcessor {
     var sectorDistances = [[Float](), [Float](), [Float]()]
     var sectorMapConfidence = [[Int](), [Int](), [Int]()]
     var corridorDistances: [Float] = []
+    var tripDistances: [Float] = []
+    var tripHeights: [Float] = []
+    var corridorBodyDistances: [Float] = []
 
     for point in obstacleMap.values {
       let delta = point.position - cameraPosition
@@ -257,8 +315,51 @@ final class DepthProcessor {
       }
       if abs(lateralDistance) <= Float(options.corridorWidthM / 2) {
         corridorDistances.append(distance)
+
+        // Split corridor evidence into a low trip band (wires, cords, kerbs)
+        // and a body-height band so a low-only hazard can be called out even
+        // though it barely moves the aggregate corridor distance.
+        if let floorHeight, forwardDistance <= hazardRangeM {
+          let heightAboveFloor = point.position.y - floorHeight
+          if heightAboveFloor >= tripBandMinM, heightAboveFloor < tripBandMaxM {
+            tripDistances.append(forwardDistance)
+            tripHeights.append(heightAboveFloor)
+          } else if heightAboveFloor >= 0.35, heightAboveFloor <= 2.0 {
+            corridorBodyDistances.append(forwardDistance)
+          }
+        }
       }
     }
+
+    dropOffMap = dropOffMap.filter { now - $0.value.updatedAt <= dropOffLifetime }
+    var dropOffDistances: [Float] = []
+    var dropOffDepths: [Float] = []
+    if let floorHeight {
+      for point in dropOffMap.values {
+        let delta = point.position - cameraPosition
+        let forwardDistance = simd_dot(delta, forward)
+        let lateralDistance = simd_dot(delta, right)
+        guard forwardDistance >= 0.2,
+              forwardDistance <= hazardRangeM,
+              abs(lateralDistance) <= Float(options.corridorWidthM / 2) else { continue }
+        dropOffDistances.append(forwardDistance)
+        dropOffDepths.append(floorHeight - point.position.y)
+      }
+    }
+
+    // Several distinct voxels must agree before either hazard is reported;
+    // the TypeScript policy additionally requires consecutive frames.
+    let dropOffDetected = dropOffDistances.count >= 8
+    let tripLeadDistance = percentile(tripDistances, 0.15)
+    let bodyLeadDistance = percentile(corridorBodyDistances, 0.15)
+    // A trip hazard is only meaningful when the low object leads whatever the
+    // regular corridor alerts would describe; otherwise the standard obstacle
+    // announcement already covers it.
+    let tripDetected: Bool = {
+      guard tripDistances.count >= 5, let tripLeadDistance else { return false }
+      guard let bodyLeadDistance else { return true }
+      return tripLeadDistance + 0.35 < bodyLeadDistance
+    }()
 
     let estimatedPerSector = max(Double(examined) / 3.0, 1)
     let leftCoverage = min(Double(sectorReliableCounts[0]) / estimatedPerSector, 1)
@@ -313,7 +414,22 @@ final class DepthProcessor {
         "coverage": corridorCoverage,
         "risk": corridorRisk
       ],
-      "route": route
+      "route": route,
+      "hazards": [
+        "floorDetected": floorHeight != nil,
+        "dropOff": [
+          "detected": dropOffDetected,
+          "distanceM": bridgeNumber(dropOffDetected ? percentile(dropOffDistances, 0.15) : nil),
+          "depthM": bridgeNumber(dropOffDetected ? percentile(dropOffDepths, 0.85) : nil),
+          "sampleCount": dropOffDistances.count
+        ],
+        "tripHazard": [
+          "detected": tripDetected,
+          "distanceM": bridgeNumber(tripDetected ? tripLeadDistance : nil),
+          "heightM": bridgeNumber(tripDetected ? percentile(tripHeights, 0.85) : nil),
+          "sampleCount": tripDistances.count
+        ]
+      ]
     ]
   }
 
@@ -390,9 +506,13 @@ final class DepthProcessor {
   }
 
   private func percentile15(_ values: [Float]) -> Float? {
+    percentile(values, 0.15)
+  }
+
+  private func percentile(_ values: [Float], _ fraction: Double) -> Float? {
     guard !values.isEmpty else { return nil }
     let sorted = values.sorted()
-    let index = Int(floor(Double(sorted.count - 1) * 0.15))
+    let index = Int(floor(Double(sorted.count - 1) * fraction))
     return sorted[index]
   }
 

@@ -13,6 +13,9 @@ short-range indoor guidance.
 - Detected-floor removal, body-envelope filtering, three forward sectors, and walking-corridor risk
 - Conservative unknown states for low coverage, invalid aim, or degraded AR tracking
 - Stable TypeScript alert hysteresis and escalating haptic patterns
+- Experimental ground-hazard alerts: below-floor evidence inside the walking corridor
+  (descending stairs, ditches, kerb drops) and low leading obstacles in the trip band
+  (wires, cords, kerbs), each confirmed across consecutive frames before speaking
 - Speed-adaptive warning distance using reaction and braking-distance calculations
 - Stabilized local steering cues: straight, slight left/right, left/right, and stop
 - A three-second, world-locked free-space map with conservative unknown-space handling
@@ -32,6 +35,11 @@ confidence, tracking, motion, risk, and route-guidance values cross the React Na
 
 The planner is deliberately local (about three metres), not building-scale turn-by-turn routing.
 It cannot guarantee that an opening, stair, drop-off, glass surface, or crossing is safe.
+
+Ground-hazard alerts are evidence-based and conservative: they only fire when the LiDAR
+actually measures a surface well below the detected floor, or a distinct low obstacle,
+with high confidence in the near field. They can miss hazards entirely (glass, water,
+occlusion, absent returns) and must never replace a cane or guide dog for edge detection.
 
 ## Run on a LiDAR device
 
