@@ -3,7 +3,9 @@ import { RouteDebugOverlay } from '../components/RouteDebugOverlay';
 import { SectorStatus } from '../components/SectorStatus';
 import { StatusAnnouncement } from '../components/StatusAnnouncement';
 import { useLidarScanner } from '../features/scanning/useLidarScanner';
+import { useVoiceInput } from '../features/speech/useVoiceInput';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useRef, useState } from 'react';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 const RISK_LABEL = {
@@ -26,6 +28,42 @@ const GUIDANCE_LABEL = {
 
 export default function ScannerScreen() {
   const scanner = useLidarScanner();
+
+  // Walk & talk: hands-free conversation loop. Listen -> user speaks ->
+  // companion replies (mic closed while it talks) -> listen again.
+  const [walkTalk, setWalkTalk] = useState(false);
+  const walkTalkRef = useRef(false);
+  const voiceRef = useRef<{ start: () => Promise<void> } | null>(null);
+
+  const resumeListening = useCallback((delayMs: number) => {
+    if (!walkTalkRef.current) return;
+    setTimeout(() => {
+      if (walkTalkRef.current) void voiceRef.current?.start();
+    }, delayMs);
+  }, []);
+
+  const voice = useVoiceInput(
+    (text) => {
+      void (async () => {
+        await scanner.askCompanion(text); // resolves after the reply is spoken
+        resumeListening(350);
+      })();
+    },
+    {
+      // Silence or recognition hiccup: quietly reopen the mic.
+      onEnd: (gotText) => {
+        if (!gotText) resumeListening(600);
+      },
+    },
+  );
+  voiceRef.current = voice;
+
+  const toggleWalkTalk = useCallback(() => {
+    const next = !walkTalkRef.current;
+    walkTalkRef.current = next;
+    setWalkTalk(next);
+    if (next) void voiceRef.current?.start();
+  }, []);
   const visibleRisk = scanner.active ? scanner.alert.risk : 'unknown';
   const riskLabel = RISK_LABEL[visibleRisk];
   const riskDetail =
@@ -184,6 +222,94 @@ export default function ScannerScreen() {
             Describe scene
           </Text>
         </Pressable>
+
+        {scanner.sceneHazards.length > 0 ? (
+          <View
+            accessible
+            accessibilityLabel={`Detected hazards: ${scanner.sceneHazards
+              .map((h) => `${h.label}, ${h.direction}, ${h.proximity}`)
+              .join('. ')}`}
+            style={styles.hazards}
+          >
+            <Text maxFontSizeMultiplier={1.5} style={styles.hazardsTitle}>
+              DETECTED HAZARDS · STRUCTURED
+            </Text>
+            {scanner.sceneHazards.map((hazard, index) => (
+              <View key={`${hazard.label}-${index}`} style={styles.hazardRow}>
+                <Text maxFontSizeMultiplier={1.5} style={styles.hazardLabel}>
+                  {hazard.label}
+                </Text>
+                <Text maxFontSizeMultiplier={1.5} style={styles.hazardMeta}>
+                  {hazard.direction.toUpperCase()} · {hazard.proximity} · {hazard.confidence}
+                </Text>
+              </View>
+            ))}
+          </View>
+        ) : null}
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ selected: scanner.alertVoice }}
+          accessibilityLabel={
+            scanner.alertVoice ? 'Turn off spoken alerts' : 'Turn on spoken alerts'
+          }
+          accessibilityHint="Spoken obstacle warnings like Stop and Obstacle left. Vibration alerts always stay on."
+          onPress={() => scanner.toggleAlertVoice()}
+          style={[styles.describe, scanner.alertVoice && styles.companionOn]}
+        >
+          <Text maxFontSizeMultiplier={1.6} style={styles.describeText}>
+            {scanner.alertVoice ? 'Alert voice: on' : 'Alert voice: off'}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ selected: scanner.companion }}
+          accessibilityLabel={
+            scanner.companion ? 'Turn off companion mode' : 'Turn on companion mode'
+          }
+          accessibilityHint="Companion mode talks with you like a friend during your journey."
+          onPress={() => scanner.toggleCompanion()}
+          style={[styles.describe, scanner.companion && styles.companionOn]}
+        >
+          <Text maxFontSizeMultiplier={1.6} style={styles.describeText}>
+            {scanner.companion ? 'Companion mode: on' : 'Companion mode: off'}
+          </Text>
+        </Pressable>
+
+        {scanner.companion ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ selected: walkTalk }}
+            accessibilityLabel={walkTalk ? 'Stop walk and talk' : 'Start walk and talk'}
+            accessibilityHint="Hands-free conversation for the whole journey. The companion listens, answers, then listens again."
+            onPress={toggleWalkTalk}
+            style={[styles.talk, walkTalk && styles.talkActive]}
+          >
+            <Text maxFontSizeMultiplier={1.6} style={styles.talkText}>
+              {walkTalk
+                ? voice.listening
+                  ? 'Listening… (tap to stop)'
+                  : 'Walk & talk: on (tap to stop)'
+                : 'Walk & talk: start conversation'}
+            </Text>
+          </Pressable>
+        ) : null}
+
+        {scanner.companion && !walkTalk ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Hold to talk"
+            accessibilityHint="Hold down, speak your question, then release to send it."
+            onPressIn={() => void voice.start()}
+            onPressOut={() => voice.stop()}
+            style={[styles.describe, voice.listening && styles.talkActive]}
+          >
+            <Text maxFontSizeMultiplier={1.6} style={styles.describeText}>
+              {voice.listening ? 'Listening… release to send' : 'Hold to talk (single question)'}
+            </Text>
+          </Pressable>
+        ) : null}
 
         <View style={styles.safetyNote}>
           <Text maxFontSizeMultiplier={2} style={styles.safetyTitle}>
@@ -420,10 +546,62 @@ const styles = StyleSheet.create({
   describeDisabled: {
     opacity: 0.4,
   },
+  companionOn: {
+    backgroundColor: '#2E331A',
+    borderColor: '#F2FF63',
+    borderWidth: 2,
+  },
+  talk: {
+    minHeight: 72,
+    borderRadius: 16,
+    backgroundColor: '#F2FF63',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  talkActive: {
+    backgroundColor: '#FF6B66',
+  },
+  talkText: {
+    color: '#0B0D10',
+    fontSize: 18,
+    fontWeight: '900',
+  },
   describeText: {
     color: '#F2FF63',
     fontSize: 18,
     fontWeight: '800',
+  },
+  hazards: {
+    borderRadius: 16,
+    backgroundColor: '#1C1710',
+    borderWidth: 1,
+    borderColor: '#7A5A24',
+    padding: 14,
+    gap: 8,
+  },
+  hazardsTitle: {
+    color: '#F0B54A',
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+  },
+  hazardRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    gap: 8,
+  },
+  hazardLabel: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '700',
+    flexShrink: 1,
+  },
+  hazardMeta: {
+    color: '#C9A05E',
+    fontSize: 12,
+    fontWeight: '700',
   },
   safetyNote: {
     borderTopWidth: 1,

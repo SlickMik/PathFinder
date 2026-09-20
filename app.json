@@ -17,7 +17,19 @@
           }
         }
       ],
-      ["expo-audio", { "microphonePermission": false }]
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "PathFinder uses the microphone so you can talk to your journey companion. Audio is only captured while you hold the talk button."
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "PathFinder uses the microphone so you can talk to your journey companion.",
+          "speechRecognitionPermission": "PathFinder converts your speech to text to answer your questions."
+        }
+      ]
     ],
     "ios": {
       "supportsTablet": true,
@@ -25,7 +37,8 @@
       "deploymentTarget": "16.4",
       "infoPlist": {
         "NSCameraUsageDescription": "PathFinder uses the camera and LiDAR sensor to detect nearby obstacles while you choose to scan.",
-        "UIBackgroundModes": []
+        "UIBackgroundModes": [],
+        "NSMicrophoneUsageDescription": "PathFinder uses the microphone so you can talk to your journey companion. Audio is only captured while you hold the talk button."
       }
     },
     "experiments": {

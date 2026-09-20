@@ -4,8 +4,10 @@ import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
-import { describeCurrentScene } from '../speech/sceneDescriber';
-import { speak, stopSpeaking } from '../speech/speech';
+import { companionSay, resetCompanion } from '../speech/companion';
+import { describeCurrentScene, fetchSceneHazards } from '../speech/sceneDescriber';
+import type { SceneHazard } from '../speech/sceneDescriber';
+import { speak, speakStream, stopSpeaking } from '../speech/speech';
 import { emitRiskHaptic, hapticIntervalMs } from './haptics';
 import { safetyEnvelopeForSpeed } from './motionSafety';
 import {
@@ -44,12 +46,39 @@ export function useLidarScanner() {
   const [liveDebugError, setLiveDebugError] = useState<string | null>(null);
   const alertRef = useRef(INITIAL_ALERT_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
+  const snapshotRef = useRef<ObstacleSnapshot | null>(null);
+  // Sponsor experience (Baseten-powered companion) is on by default;
+  // deterministic local alerts still take priority over all of it.
+  const companionRef = useRef(true);
+  const [companion, setCompanionState] = useState(true);
+  // Spoken obstacle/guidance alerts ("Stop", "Obstacle left"). OFF by default
+  // so they don't talk over the companion — haptics always stay on regardless.
+  const alertVoiceRef = useRef(false);
+  const [alertVoice, setAlertVoiceState] = useState(false);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({
     instruction: 'hold',
     surfaceClass: null as NavigationGuidance['surfaceClass'],
     timestamp: 0,
   });
+  const lastAlertSpeechRef = useRef({ text: '', timestamp: 0 });
+  // Rolling log of journey moments (guidance/risk changes) so the companion
+  // can reference what just happened on the walk.
+  const journeyEventsRef = useRef<Array<{ at: number; event: string }>>([]);
+  const [sceneHazards, setSceneHazards] = useState<SceneHazard[]>([]);
+  // Journey stats for the end-of-walk debrief.
+  const journeyStatsRef = useRef({
+    startedAt: null as number | null,
+    nearCount: 0,
+    criticalCount: 0,
+    guidanceChanges: 0,
+  });
+
+  const logJourneyEvent = useCallback((event: string) => {
+    const events = journeyEventsRef.current;
+    events.push({ at: Date.now(), event });
+    if (events.length > 8) events.shift();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -81,6 +110,7 @@ export function useLidarScanner() {
 
   const speakGuidance = useCallback(
     (nextGuidance: NavigationGuidance, previousGuidance: NavigationGuidance) => {
+      if (!alertVoiceRef.current) return;
       if (!nextGuidance.phrase || nextGuidance.instruction === 'hold') return;
 
       const now = Date.now();
@@ -117,6 +147,7 @@ export function useLidarScanner() {
 
   useEffect(() => {
     const snapshotSubscription = ExpoLidarVision.onSnapshot((nextSnapshot) => {
+      snapshotRef.current = nextSnapshot;
       setSnapshot(nextSnapshot);
 
       const nextSafetyEnvelope = safetyEnvelopeForSpeed(
@@ -130,6 +161,11 @@ export function useLidarScanner() {
         nextSnapshot,
         nextSafetyEnvelope,
       );
+      if (nextAlert.risk !== alertRef.current.risk) {
+        logJourneyEvent(`obstacle risk went from ${alertRef.current.risk} to ${nextAlert.risk}`);
+        if (nextAlert.risk === 'near') journeyStatsRef.current.nearCount += 1;
+        if (nextAlert.risk === 'critical') journeyStatsRef.current.criticalCount += 1;
+      }
       alertRef.current = nextAlert;
       setAlert(nextAlert);
 
@@ -142,13 +178,32 @@ export function useLidarScanner() {
       setGuidance(nextGuidance);
       speakGuidance(nextGuidance, previousGuidance);
 
+      if (
+        nextGuidance.instruction !== previousGuidance.instruction &&
+        nextGuidance.instruction !== 'hold'
+      ) {
+        logJourneyEvent(`guidance changed to "${nextGuidance.instruction}" (${nextGuidance.source})`);
+        journeyStatsRef.current.guidanceChanges += 1;
+      }
+
       const viewValid =
         nextSnapshot.tracking === 'normal' && nextSnapshot.deviceAim === 'forward';
       setStatus(viewValid ? 'scanning' : 'paused');
       if (viewValid) setErrorMessage(null);
 
-      if (nextAlert.announcement) {
-        announce(nextAlert.announcement, nextAlert.risk === 'critical');
+      if (nextAlert.announcement && alertVoiceRef.current) {
+        // Alert speech pacing. Without this, sector flapping (left/center)
+        // re-announces at up to 10 Hz and critical alerts interrupt
+        // themselves constantly.
+        const critical = nextAlert.risk === 'critical';
+        const now = Date.now();
+        const last = lastAlertSpeechRef.current;
+        const repeatSameText = last.text === nextAlert.announcement && now - last.timestamp < 2500;
+        const tooSoonForNonCritical = !critical && now - last.timestamp < 3000;
+        if (!repeatSameText && !tooSoonForNonCritical) {
+          lastAlertSpeechRef.current = { text: nextAlert.announcement, timestamp: now };
+          announce(nextAlert.announcement, critical);
+        }
       }
     });
 
@@ -177,6 +232,7 @@ export function useLidarScanner() {
   const stop = useCallback(async (announceStop = true) => {
     await ExpoLidarVision.stop();
     setActive(false);
+    snapshotRef.current = null;
     setSnapshot(null);
     alertRef.current = INITIAL_ALERT_STATE;
     setAlert(INITIAL_ALERT_STATE);
@@ -193,7 +249,33 @@ export function useLidarScanner() {
     setStatus((current) => (current === 'unsupported' ? current : 'ready'));
     deactivateKeepAwake(KEEP_AWAKE_TAG);
     void stopSpeaking();
-    if (announceStop) void speak('Obstacle alerts stopped.');
+    if (announceStop) {
+      void speak('Obstacle alerts stopped.');
+      if (companionRef.current) {
+        // Journey debrief — async, no latency budget. Kimi gets the walk's
+        // stats and recent events and closes out the journey warmly.
+        const stats = journeyStatsRef.current;
+        const durationS = stats.startedAt
+          ? Math.round((Date.now() - stats.startedAt) / 1000)
+          : 0;
+        const now = Date.now();
+        const recentEvents = journeyEventsRef.current.map(
+          (entry) => `${Math.round((now - entry.at) / 1000)}s ago: ${entry.event}`,
+        );
+        const debriefPrompt =
+          `The walk just ended. Give me a short, warm end-of-journey debrief (2-3 sentences). ` +
+          `Stats: duration ${Math.floor(durationS / 60)}m ${durationS % 60}s, ` +
+          `close-call moments: ${stats.nearCount}, critical stops: ${stats.criticalCount}, ` +
+          `direction changes: ${stats.guidanceChanges}.`;
+        const speech = speakStream();
+        void companionSay(debriefPrompt, {
+          events: recentEvents,
+          onDelta: (delta) => speech.push(delta),
+        })
+          .then(() => speech.done())
+          .catch(() => {});
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -275,9 +357,29 @@ export function useLidarScanner() {
 
       await ExpoLidarVision.start(DEFAULT_LIDAR_OPTIONS);
       await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
+      journeyStatsRef.current = {
+        startedAt: Date.now(),
+        nearCount: 0,
+        criticalCount: 0,
+        guidanceChanges: 0,
+      };
+      journeyEventsRef.current = [];
+      setSceneHazards([]);
       setActive(true);
       setStatus('scanning');
-      announce('Obstacle alerts started. Hold the phone upright and point it forward.');
+      if (companionRef.current) {
+        // Deterministic confirmation first, then the streamed greeting.
+        announce('Obstacle alerts started.');
+        const greeting = speakStream();
+        void companionSay(
+          "I've just turned on obstacle alerts and I'm heading out — walk with me.",
+          { snapshot: snapshotRef.current, onDelta: (delta) => greeting.push(delta) },
+        )
+          .then(() => greeting.done())
+          .catch(() => {});
+      } else {
+        announce('Obstacle alerts started. Hold the phone upright and point it forward.');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to start LiDAR.';
       setErrorMessage(message);
@@ -291,14 +393,99 @@ export function useLidarScanner() {
     if (!active) return;
     try {
       announce('Describing scene.');
-      announce(await describeCurrentScene(), true);
+      // Structured hazards (Baseten structured outputs) in parallel — lands in
+      // the UI whenever ready, never delays the spoken description.
+      void fetchSceneHazards(snapshotRef.current)
+        .then(setSceneHazards)
+        .catch(() => {});
+      // Stream the description so the first sentence is spoken as soon as the
+      // model produces it, instead of after the whole reply returns. Guard
+      // against critical alerts: this is the longest reply (max 160 tokens) and
+      // runs mid-walk, so it is the most likely to be cut off by a STOP alert —
+      // without the guard, still-arriving sentences would talk over the STOP.
+      const speech = speakStream(() => alertRef.current.risk !== 'critical');
+      const text = companionRef.current
+        ? await companionSay('What do you see around us right now?', {
+            snapshot: snapshotRef.current,
+            withFrame: true,
+            onDelta: (delta) => speech.push(delta),
+          })
+        : await describeCurrentScene(snapshotRef.current, (delta) => speech.push(delta));
+      await speech.done();
+      console.log(`[describe-scene] reply: "${text}"`);
     } catch (error) {
       announce(error instanceof Error ? error.message : 'Unable to describe the scene.');
     }
   }, [active, announce]);
+  const askCompanion = useCallback(
+    async (text: string) => {
+      console.log(`[companion] user said: "${text}"`);
+      try {
+        // The user spoke — cut off any ongoing narration immediately.
+        await stopSpeaking();
+        const now = Date.now();
+        const recentEvents = journeyEventsRef.current
+          .filter((entry) => now - entry.at < 90_000)
+          .map((entry) => `${Math.round((now - entry.at) / 1000)}s ago: ${entry.event}`);
+        // Stream the reply into incremental TTS: the first sentence starts
+        // speaking ~1s after the user stops talking, while the model is still
+        // generating the rest. The guard yields to a critical local obstacle
+        // alert — if one fires mid-reply, further sentences are dropped so the
+        // companion does not resume talking over a STOP alert.
+        const speech = speakStream(() => alertRef.current.risk !== 'critical');
+        const reply = await companionSay(text, {
+          snapshot: snapshotRef.current,
+          alert: alertRef.current,
+          guidance: guidanceRef.current,
+          events: recentEvents,
+          // Walking companion: every voice turn gets fresh eyes while scanning.
+          withFrame: active,
+          onDelta: (delta) => speech.push(delta),
+        });
+        await speech.done();
+        console.log(`[companion] reply: "${reply}"`);
+      } catch (error) {
+        console.warn('[companion] request failed:', error);
+        announce('Companion is unavailable right now.');
+      }
+    },
+    [active, announce],
+  );
+
+  const toggleAlertVoice = useCallback(() => {
+    const next = !alertVoiceRef.current;
+    alertVoiceRef.current = next;
+    setAlertVoiceState(next);
+    void speak(next ? 'Alert voice on.' : 'Alert voice off. Haptics stay on.', true);
+  }, []);
+
+  const toggleCompanion = useCallback(() => {
+    const next = !companionRef.current;
+    companionRef.current = next;
+    setCompanionState(next);
+    if (next) {
+      resetCompanion();
+      announce('Companion mode on.');
+      const greeting = speakStream();
+      void companionSay("Hey, I'm here — keeping you company on the way today.", {
+        snapshot: snapshotRef.current,
+        onDelta: (delta) => greeting.push(delta),
+      })
+        .then(() => greeting.done())
+        .catch(() => {});
+    } else {
+      announce('Companion mode off.');
+    }
+  }, [announce]);
 
   return {
     active,
+    alertVoice,
+    sceneHazards,
+    toggleAlertVoice,
+    askCompanion,
+    companion,
+    toggleCompanion,
     describeScene,
     alert,
     errorMessage,
