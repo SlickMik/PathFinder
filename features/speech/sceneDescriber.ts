@@ -4,6 +4,10 @@ import type { ObstacleSnapshot, SectorReading } from '../scanning/types';
 const SCENE_URL = process.env.EXPO_PUBLIC_SCENE_DESCRIBE_URL;
 const APP_SECRET = process.env.EXPO_PUBLIC_SCENE_APP_SECRET;
 const REQUEST_TIMEOUT_MS = 15_000;
+// Streamed replies get a larger no-delta budget: a cold vision model can take
+// ~13s to its first token, and the stall timer only resets once tokens flow,
+// so the pre-first-token window needs more headroom than a buffered round-trip.
+const STREAM_TIMEOUT_MS = 25_000;
 
 // Compact LiDAR context per PLAN.md §8 — sector distances and tracking
 // quality only, never the full depth map.
@@ -84,7 +88,7 @@ async function requestDescription(
   };
   try {
     const text = onDelta
-      ? await streamSSE(SCENE_URL, headers, body, { onDelta, timeoutMs: REQUEST_TIMEOUT_MS })
+      ? await streamSSE(SCENE_URL, headers, body, { onDelta, timeoutMs: STREAM_TIMEOUT_MS })
       : await postJSON(SCENE_URL, headers, body, REQUEST_TIMEOUT_MS);
     if (!text) throw new Error('No description returned.');
     return text;
@@ -181,10 +185,18 @@ export function streamSSE(
   xhr.open('POST', url);
   for (const [key, value] of Object.entries(headers)) xhr.setRequestHeader(key, value);
   xhr.responseType = 'text';
-  // Native timeout fires `ontimeout` (not `onload`/`onerror`), so the promise
-  // always settles. A manual timer + abort would fire `onabort` instead, which
-  // we also handle below as a backstop.
-  xhr.timeout = timeoutMs;
+  // Stall timeout, not a wall-clock deadline. A streamed reply can take well
+  // over 10s to its first token on a cold vision model, and inter-token gaps
+  // are normal — a fixed xhr.timeout would abort mid-sentence after the user
+  // has already heard part of it. So we arm a timer now, reset it on every
+  // delta in pump(), and only abort if the stream goes silent for `timeoutMs`.
+  // clearTimeout on an already-fired handle is a no-op, so no null guards.
+  let stallTimer = setTimeout(() => xhr.abort(), timeoutMs);
+  const armStall = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => xhr.abort(), timeoutMs);
+  };
+
 
   let processed = 0; // how far into responseText we've consumed
   let full = '';
@@ -194,6 +206,7 @@ export function streamSSE(
   const settle = (fn: () => void) => {
     if (settled) return;
     settled = true;
+    clearTimeout(stallTimer);
     fn();
   };
 
@@ -202,15 +215,16 @@ export function streamSSE(
     if (text.length <= processed) return;
     const result = parseSseChunk(text, processed);
     processed = result.nextOffset;
-    for (const delta of result.deltas) {
-      full += delta;
-      onDelta(delta);
+    if (result.deltas.length > 0) {
+      for (const delta of result.deltas) {
+        full += delta;
+        onDelta(delta);
+      }
+      // Tokens are still flowing — push the stall deadline forward.
+      armStall();
     }
     if (result.error) streamError = new Error(result.error);
   };
-
-  const timeoutError = () =>
-    Object.assign(new Error('Stream timed out.'), { name: 'AbortError' });
 
   xhr.onprogress = pump;
   xhr.onload = () => {
@@ -222,10 +236,13 @@ export function streamSSE(
     });
   };
   xhr.onerror = () => settle(() => reject(new Error('Stream network error.')));
-  xhr.ontimeout = () => settle(() => reject(timeoutError()));
-  // abort fires when xhr.abort() is called externally or by the runtime; treat
-  // it as a cancellation/timeout so callers do not hang forever.
-  xhr.onabort = () => settle(() => reject(timeoutError()));
+  // The stall timer calls xhr.abort() when the stream goes silent; abort fires
+  // onabort (not ontimeout, since we never set xhr.timeout), which rejects so
+  // callers never hang.
+  xhr.onabort = () =>
+    settle(() =>
+      reject(Object.assign(new Error('Stream timed out.'), { name: 'AbortError' })),
+    );
 
   xhr.send(JSON.stringify(body));
   return promise;

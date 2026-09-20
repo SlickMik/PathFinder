@@ -11,6 +11,10 @@ const COMPANION_URL =
   process.env.EXPO_PUBLIC_COMPANION_URL ?? SCENE_URL?.replace('/describe-scene', '/companion');
 const APP_SECRET = process.env.EXPO_PUBLIC_SCENE_APP_SECRET;
 const REQUEST_TIMEOUT_MS = 15_000;
+// Streamed replies get a larger no-delta budget than a buffered round-trip: a
+// cold vision model can take ~13s to its first token, and the stall timer only
+// resets once tokens flow.
+const STREAM_TIMEOUT_MS = 25_000;
 const MAX_TURNS = 16;
 
 type Turn = { role: 'user' | 'assistant'; content: string };
@@ -91,7 +95,7 @@ async function requestReply(
 
   try {
     const reply = onDelta
-      ? await streamSSE(COMPANION_URL, headers, body, { onDelta, timeoutMs: REQUEST_TIMEOUT_MS })
+      ? await streamSSE(COMPANION_URL, headers, body, { onDelta, timeoutMs: STREAM_TIMEOUT_MS })
       : await postReply(COMPANION_URL, headers, body, REQUEST_TIMEOUT_MS);
     if (!reply) throw new Error('No reply returned.');
 

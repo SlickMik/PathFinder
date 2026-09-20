@@ -219,8 +219,11 @@ export function useLidarScanner() {
     if (announceStop) {
       void speak('Obstacle alerts stopped.');
       if (companionRef.current) {
-        void companionSay("I've stopped for now — that's the end of this stretch of the journey.")
-          .then((reply) => speak(reply))
+        const speech = speakStream();
+        void companionSay("I've stopped for now — that's the end of this stretch of the journey.", {
+          onDelta: (delta) => speech.push(delta),
+        })
+          .then(() => speech.done())
           .catch(() => {});
       }
     }
@@ -308,13 +311,14 @@ export function useLidarScanner() {
       setActive(true);
       setStatus('scanning');
       if (companionRef.current) {
-        // Deterministic confirmation first, then the conversational greeting.
+        // Deterministic confirmation first, then the streamed greeting.
         announce('Obstacle alerts started.');
+        const greeting = speakStream();
         void companionSay(
           "I've just turned on obstacle alerts and I'm heading out — walk with me.",
-          { snapshot: snapshotRef.current },
+          { snapshot: snapshotRef.current, onDelta: (delta) => greeting.push(delta) },
         )
-          .then((reply) => announce(reply))
+          .then(() => greeting.done())
           .catch(() => {});
       } else {
         announce('Obstacle alerts started. Hold the phone upright and point it forward.');
@@ -333,8 +337,11 @@ export function useLidarScanner() {
     try {
       announce('Describing scene.');
       // Stream the description so the first sentence is spoken as soon as the
-      // model produces it, instead of after the whole reply returns.
-      const speech = speakStream();
+      // model produces it, instead of after the whole reply returns. Guard
+      // against critical alerts: this is the longest reply (max 160 tokens) and
+      // runs mid-walk, so it is the most likely to be cut off by a STOP alert —
+      // without the guard, still-arriving sentences would talk over the STOP.
+      const speech = speakStream(() => alertRef.current.risk !== 'critical');
       const text = companionRef.current
         ? await companionSay('What do you see around us right now?', {
             snapshot: snapshotRef.current,
@@ -397,10 +404,12 @@ export function useLidarScanner() {
     if (next) {
       resetCompanion();
       announce('Companion mode on.');
+      const greeting = speakStream();
       void companionSay("Hey, I'm here — keeping you company on the way today.", {
         snapshot: snapshotRef.current,
+        onDelta: (delta) => greeting.push(delta),
       })
-        .then((reply) => announce(reply))
+        .then(() => greeting.done())
         .catch(() => {});
     } else {
       announce('Companion mode off.');

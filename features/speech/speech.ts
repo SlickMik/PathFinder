@@ -1,5 +1,6 @@
 import { setAudioModeAsync } from 'expo-audio';
 import * as Speech from 'expo-speech';
+import { splitSentences } from './sentenceSplit';
 
 let audioReady: Promise<void> | null = null;
 // undefined = not resolved yet; null = resolved, use system default.
@@ -154,15 +155,9 @@ export function speakStream(guard?: () => boolean): SpeakStream {
     push(text) {
       if (finished) return;
       buffer += text;
-      // Emit at each sentence boundary: text up to and including terminal
-      // punctuation, but ONLY when the punctuation is followed by real
-      // whitespace — otherwise "2.1" or "1.3 m" would split mid-number and
-      // TTS would say "the 2" then "1 meter clearance" as separate utterances.
-      // A trailing fragment with no following whitespace is flushed by done().
-      let match;
-      while ((match = buffer.match(/^[\s\S]*?[.!?]+\s+/))) {
-        const sentence = match[0];
-        buffer = buffer.slice(sentence.length);
+      const { sentences, rest } = splitSentences(buffer);
+      buffer = rest;
+      for (const sentence of sentences) {
         if (!ready) waiting.push(sentence);
         else enqueue(sentence);
       }

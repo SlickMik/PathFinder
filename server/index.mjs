@@ -329,14 +329,14 @@ async function streamReply(res, requestBody, started, label) {
     Connection: 'keep-alive',
   });
   try {
-    const { content, usage, upstreamMs } = await callBaseten(requestBody, (delta) => {
+    const { usage, upstreamMs } = await callBaseten(requestBody, (delta) => {
       res.write(`data: ${JSON.stringify({ delta })}\n\n`);
     });
     res.write('data: [DONE]\n\n');
     res.end();
     const totalMs = Date.now() - started;
     console.log(
-      `[${label}] stream ok total=${totalMs}ms upstream=${upstreamMs}ms overhead=${totalMs - upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'} reply="${content.slice(0, 80)}"`,
+      `[${label}] stream ok total=${totalMs}ms upstream=${upstreamMs}ms overhead=${totalMs - upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
     );
   } catch (error) {
     // Match the non-streaming path: send a generic message to the client and
