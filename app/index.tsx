@@ -29,6 +29,11 @@ const RISK_LABEL = {
   critical: 'STOP',
 } as const;
 
+const GROUND_HAZARD_LABEL = {
+  'drop-off': 'DROP-OFF AHEAD',
+  'trip-hazard': 'TRIP HAZARD AHEAD',
+} as const;
+
 export default function ScannerScreen() {
   const scanner = useLidarScanner();
   const { height, width } = useWindowDimensions();
@@ -182,6 +187,28 @@ export default function ScannerScreen() {
               speedMps={scanner.safetyEnvelope.speedMps}
               warningDistanceM={scanner.safetyEnvelope.warningDistanceM}
             />
+
+            {scanner.active && scanner.groundHazard.active ? (
+              <View
+                accessible
+                accessibilityRole="alert"
+                accessibilityLabel={`${GROUND_HAZARD_LABEL[scanner.groundHazard.active]}. ${
+                  scanner.groundHazard.distanceM != null
+                    ? `About ${scanner.groundHazard.distanceM.toFixed(1)} metres ahead.`
+                    : 'Distance uncertain.'
+                } Stop and check with your cane.`}
+                style={styles.groundHazardPanel}
+              >
+                <Text maxFontSizeMultiplier={1.8} style={styles.groundHazardTitle}>
+                  {GROUND_HAZARD_LABEL[scanner.groundHazard.active]}
+                </Text>
+                <Text maxFontSizeMultiplier={1.8} style={styles.groundHazardDetail}>
+                  {scanner.groundHazard.distanceM != null
+                    ? `About ${scanner.groundHazard.distanceM.toFixed(1)} m ahead · check with your cane`
+                    : 'Distance uncertain · check with your cane'}
+                </Text>
+              </View>
+            ) : null}
 
             <View
               accessible
@@ -499,6 +526,28 @@ const styles = StyleSheet.create({
     backgroundColor: '#561E20',
     borderColor: '#FF6B66',
     borderWidth: 2,
+  },
+  groundHazardPanel: {
+    borderRadius: 20,
+    backgroundColor: '#5A2B10',
+    borderWidth: 2,
+    borderColor: '#FF9D42',
+    paddingHorizontal: 22,
+    paddingVertical: 18,
+    gap: 4,
+  },
+  groundHazardTitle: {
+    color: '#FFD9AE',
+    fontSize: 24,
+    lineHeight: 30,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+  },
+  groundHazardDetail: {
+    color: '#F4C79B',
+    fontSize: 14,
+    lineHeight: 20,
+    fontWeight: '700',
   },
   riskLabel: {
     color: '#FFFFFF',

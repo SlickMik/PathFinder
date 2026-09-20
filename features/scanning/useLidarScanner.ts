@@ -4,6 +4,12 @@ import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
+import {
+  INITIAL_GROUND_HAZARD_STATE,
+  escalateRisk,
+  groundHazardRisk,
+  reduceGroundHazardState,
+} from './groundHazards';
 import { companionSay, resetCompanion, understandAudio } from '../speech/companion';
 import { readAsStringAsync } from 'expo-file-system/legacy';
 import { describeCurrentScene, fetchSceneHazards } from '../speech/sceneDescriber';
@@ -25,6 +31,7 @@ import {
 import { CLOUD_AI_ENABLED } from '../speech/featureFlags';
 import type {
   AlertState,
+  GroundHazardAlertState,
   LidarSupport,
   LiveDebugFrame,
   NavigationGuidance,
@@ -44,6 +51,9 @@ export function useLidarScanner() {
   const [active, setActive] = useState(false);
   const [snapshot, setSnapshot] = useState<ObstacleSnapshot | null>(null);
   const [alert, setAlert] = useState<AlertState>(INITIAL_ALERT_STATE);
+  const [groundHazard, setGroundHazard] = useState<GroundHazardAlertState>(
+    INITIAL_GROUND_HAZARD_STATE,
+  );
   const [guidance, setGuidance] = useState<NavigationGuidance>(
     INITIAL_NAVIGATION_GUIDANCE,
   );
@@ -52,6 +62,7 @@ export function useLidarScanner() {
   const [liveDebugFrame, setLiveDebugFrame] = useState<LiveDebugFrame | null>(null);
   const [liveDebugError, setLiveDebugError] = useState<string | null>(null);
   const alertRef = useRef(INITIAL_ALERT_STATE);
+  const groundHazardRef = useRef(INITIAL_GROUND_HAZARD_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
   const snapshotRef = useRef<ObstacleSnapshot | null>(null);
   // Navigation starts quiet except for concise, deterministic guidance. The
@@ -176,6 +187,13 @@ export function useLidarScanner() {
       alertRef.current = nextAlert;
       setAlert(nextAlert);
 
+      const nextGroundHazard = reduceGroundHazardState(
+        groundHazardRef.current,
+        nextSnapshot,
+      );
+      groundHazardRef.current = nextGroundHazard;
+      setGroundHazard(nextGroundHazard);
+
       const previousGuidance = guidanceRef.current;
       const nextGuidance = reduceNavigationGuidance(
         previousGuidance,
@@ -212,11 +230,20 @@ export function useLidarScanner() {
           announce(nextAlert.announcement, critical);
         }
       }
+
+      if (nextGroundHazard.announcement && alertVoiceRef.current) {
+        announce(
+          nextGroundHazard.announcement,
+          groundHazardRisk(nextGroundHazard) === 'critical',
+        );
+      }
     });
 
     const errorSubscription = ExpoLidarVision.onError((error) => {
       alertRef.current = INITIAL_ALERT_STATE;
       setAlert(INITIAL_ALERT_STATE);
+      groundHazardRef.current = INITIAL_GROUND_HAZARD_STATE;
+      setGroundHazard(INITIAL_GROUND_HAZARD_STATE);
       guidanceRef.current = INITIAL_NAVIGATION_GUIDANCE;
       setGuidance(INITIAL_NAVIGATION_GUIDANCE);
       setSafetyEnvelope(INITIAL_SAFETY_ENVELOPE);
@@ -243,6 +270,8 @@ export function useLidarScanner() {
     setSnapshot(null);
     alertRef.current = INITIAL_ALERT_STATE;
     setAlert(INITIAL_ALERT_STATE);
+    groundHazardRef.current = INITIAL_GROUND_HAZARD_STATE;
+    setGroundHazard(INITIAL_GROUND_HAZARD_STATE);
     guidanceRef.current = INITIAL_NAVIGATION_GUIDANCE;
     setGuidance(INITIAL_NAVIGATION_GUIDANCE);
     setSafetyEnvelope(INITIAL_SAFETY_ENVELOPE);
@@ -292,15 +321,26 @@ export function useLidarScanner() {
     return () => subscription.remove();
   }, [active, stop]);
 
+  const hazardRiskLevel = groundHazardRisk(groundHazard);
   useEffect(() => {
     if (!active) return;
-    const intervalMs = hapticIntervalMs(alert.risk);
+    const effectiveRisk = escalateRisk(alert.risk, hazardRiskLevel);
+    const intervalMs = hapticIntervalMs(effectiveRisk);
     if (intervalMs === null) return;
 
-    void emitRiskHaptic(alert.risk);
-    const timer = setInterval(() => void emitRiskHaptic(alertRef.current.risk), intervalMs);
+    void emitRiskHaptic(effectiveRisk);
+    const timer = setInterval(
+      () =>
+        void emitRiskHaptic(
+          escalateRisk(
+            alertRef.current.risk,
+            groundHazardRisk(groundHazardRef.current),
+          ),
+        ),
+      intervalMs,
+    );
     return () => clearInterval(timer);
-  }, [active, alert.risk]);
+  }, [active, alert.risk, hazardRiskLevel]);
 
   useEffect(() => {
     if (!active) {
@@ -415,7 +455,11 @@ export function useLidarScanner() {
       // against critical alerts: this is the longest reply (max 160 tokens) and
       // runs mid-walk, so it is the most likely to be cut off by a STOP alert —
       // without the guard, still-arriving sentences would talk over the STOP.
-      const speech = speakStream(() => alertRef.current.risk !== 'critical');
+      const speech = speakStream(
+        () =>
+          alertRef.current.risk !== 'critical' &&
+          groundHazardRisk(groundHazardRef.current) !== 'critical',
+      );
       const text = companionRef.current
         ? await companionSay('What do you see around us right now?', {
             snapshot: snapshotRef.current,
@@ -484,6 +528,7 @@ export function useLidarScanner() {
           await speak(
             localReply,
             alertRef.current.risk === 'critical' ||
+              groundHazardRisk(groundHazardRef.current) === 'critical' ||
               guidanceRef.current.instruction === 'stop',
           );
           return;
@@ -493,6 +538,7 @@ export function useLidarScanner() {
           await speak(
             localSceneFallback(snapshotRef.current, alertRef.current, guidanceRef.current),
             alertRef.current.risk === 'critical' ||
+              groundHazardRisk(groundHazardRef.current) === 'critical' ||
               guidanceRef.current.instruction === 'stop',
           );
           return;
@@ -508,7 +554,11 @@ export function useLidarScanner() {
           if (understood) {
             console.log(`[companion] Gemini heard: "${understood.transcript}"`);
             console.log(`[companion] reply: "${understood.reply}"`);
-            const speech = speakStream(() => alertRef.current.risk !== 'critical');
+            const speech = speakStream(
+              () =>
+                alertRef.current.risk !== 'critical' &&
+                groundHazardRisk(groundHazardRef.current) !== 'critical',
+            );
             speech.push(understood.reply);
             await speech.done();
             return;
@@ -519,7 +569,11 @@ export function useLidarScanner() {
         // generating the rest. The guard yields to a critical local obstacle
         // alert — if one fires mid-reply, further sentences are dropped so the
         // companion does not resume talking over a STOP alert.
-        const speech = speakStream(() => alertRef.current.risk !== 'critical');
+        const speech = speakStream(
+          () =>
+            alertRef.current.risk !== 'critical' &&
+            groundHazardRisk(groundHazardRef.current) !== 'critical',
+        );
         const reply = await companionSay(text, {
           snapshot: snapshotRef.current,
           alert: alertRef.current,
@@ -581,6 +635,7 @@ export function useLidarScanner() {
     describeScene,
     alert,
     errorMessage,
+    groundHazard,
     guidance,
     liveDebugError,
     liveDebugFrame,
