@@ -12,6 +12,7 @@ import {
   INITIAL_NAVIGATION_GUIDANCE,
   planNavigation,
   reduceNavigationGuidance,
+  surfacePhrase,
 } from './navigation';
 import type {
   AlertState,
@@ -44,7 +45,11 @@ export function useLidarScanner() {
   const alertRef = useRef(INITIAL_ALERT_STATE);
   const guidanceRef = useRef(INITIAL_NAVIGATION_GUIDANCE);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
-  const lastGuidanceSpeechRef = useRef({ instruction: 'hold', timestamp: 0 });
+  const lastGuidanceSpeechRef = useRef({
+    instruction: 'hold',
+    surfaceClass: null as NavigationGuidance['surfaceClass'],
+    timestamp: 0,
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -80,19 +85,31 @@ export function useLidarScanner() {
 
       const now = Date.now();
       const last = lastGuidanceSpeechRef.current;
-      const changed = nextGuidance.instruction !== previousGuidance.instruction;
+      const directionChanged = nextGuidance.instruction !== previousGuidance.instruction;
+      const surfaceChanged =
+        nextGuidance.surfaceClass !== null &&
+        nextGuidance.surfaceClass !== last.surfaceClass;
+      const changed = directionChanged || surfaceChanged;
       const repeatAfterMs = nextGuidance.instruction === 'stop' ? 1600 : 5000;
       if (!changed && now - last.timestamp < repeatAfterMs) return;
-      if (last.instruction === nextGuidance.instruction && now - last.timestamp < repeatAfterMs) {
+      if (last.instruction === nextGuidance.instruction &&
+          now - last.timestamp < (surfaceChanged ? 3000 : repeatAfterMs)) {
         return;
       }
 
       lastGuidanceSpeechRef.current = {
         instruction: nextGuidance.instruction,
+        surfaceClass: nextGuidance.surfaceClass,
         timestamp: now,
       };
+      const detectedSurface = surfaceChanged && nextGuidance.instruction !== 'stop'
+        ? surfacePhrase(nextGuidance.surfaceClass)
+        : null;
+      const phrase = detectedSurface
+        ? `${nextGuidance.phrase} ${detectedSurface}`
+        : nextGuidance.phrase;
       void stopSpeaking().finally(() =>
-        speak(nextGuidance.phrase!, nextGuidance.instruction === 'stop'),
+        speak(phrase, nextGuidance.instruction === 'stop'),
       );
     },
     [],
@@ -166,7 +183,11 @@ export function useLidarScanner() {
     guidanceRef.current = INITIAL_NAVIGATION_GUIDANCE;
     setGuidance(INITIAL_NAVIGATION_GUIDANCE);
     setSafetyEnvelope(INITIAL_SAFETY_ENVELOPE);
-    lastGuidanceSpeechRef.current = { instruction: 'hold', timestamp: 0 };
+    lastGuidanceSpeechRef.current = {
+      instruction: 'hold',
+      surfaceClass: null,
+      timestamp: 0,
+    };
     setLiveDebugFrame(null);
     setLiveDebugError(null);
     setStatus((current) => (current === 'unsupported' ? current : 'ready'));

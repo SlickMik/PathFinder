@@ -51,14 +51,14 @@ runtime accepts other resolutions. Output either:
 - a one-channel UInt8 pixel buffer containing class IDs; or
 - an `MLMultiArray` label map, or logits shaped like `[1, 9, height, width]`.
 
-The bundled 12-channel baseline is mapped conservatively: its road channel becomes `road`, its
-sidewalk channel becomes `sidewalk`, and all unsupported classes become `background`. A replacement
-Mobilio-style model should use this exact nine-class order:
+The bundled 12-channel outdoor baseline is not validated for indoor floor recognition. Its labels
+now remain unknown for routing; the previous road-to-floor reinterpretation produced false
+walkable walls. A trained replacement should use this exact nine-class order:
 
 | ID | Class | Planner treatment |
 |---:|---|---|
 | 0 | background | unknown |
-| 1 | terrain | weak walkable evidence |
+| 1 | terrain | unknown / not used for routing |
 | 2 | road | boundary unless a future crossing mode authorizes it |
 | 3 | curb | boundary |
 | 4 | curb cut | walkable |
@@ -67,17 +67,66 @@ Mobilio-style model should use this exact nine-class order:
 | 7 | zebra crosswalk | walkable |
 | 8 | covering | walkable |
 
+For doorway navigation, add a tenth class at ID 9: `doorway-opening`. Train door leaves and
+doorframes as boundary/background, and label only the visible traversable opening plus its floor
+as `doorway-opening`. The runtime treats ID 9 as walkable evidence and reports
+`surfaceClass: "doorway-opening"` when that class dominates the selected route. The gap still has
+to pass the LiDAR clearance check; a visual opening alone can never authorize movement.
+
 Road is intentionally conservative. The paper can combine surface perception with a navigation
 route and crossing context; this app does not yet have that state, so treating every road pixel as
 walkable would be unsafe.
 
 ## Runtime behavior
 
-`WalkableSurfaceSegmenter.swift` runs the model at most about 5.5 times per second and keeps all
-inference on device. `DepthProcessor.swift` projects candidate ground cells through the current
-ARKit camera transform and samples the label mask. `LocalRoutePlanner.swift` temporally fuses the
-labels with LiDAR free-space evidence, rejects road and curb cells, inflates obstacles by the body
-envelope, and runs A*.
+The camera debug overlay uses scene depth from the same displayed AR frame. Blue pixels are
+within 8 cm of ARKit's detected floor; red pixels are observed surfaces 8 cm to 2 m above it.
+Nothing is colored until a floor is detected. This is geometric floor detection, not a trained
+indoor semantic model. The planned route is shown only on the top-down map: projecting that
+2D route into the camera using distance-based screen coordinates was incorrect.
+
+`WalkableSurfaceSegmenter.swift` schedules at most 10 inferences per second on a dedicated serial
+queue and keeps all inference on device. LiDAR processing never waits for the model; it uses the
+newest completed mask. `DepthProcessor.swift` projects candidate ground cells through the current
+capture-time ARKit camera transform and samples the label mask. Masks older than one second are
+discarded before projection. `LocalRoutePlanner.swift` temporally fuses the
+near-field labels with LiDAR free-space evidence, rejects road and curb cells, inflates obstacles
+by the body envelope, and runs Mobilio's alternating line search (0, +2, -2 degrees through
+±90 degrees) over a two-metre corridor. The first fully observed, unblocked ray supplies steering;
+A* supplies a curved route if none of those straight rays passes. Both searches reject diagonal
+corner cutting and unknown cells. New obstacle returns override older free-space evidence.
+
+`MobilioRouteAdvisor.swift` ports the useful navigation logic from Mobilio's Unity
+`scripts/Vision.cs`: a 0.2 m world grid extending up to 15 m, strict/lax class handling, a
+one-degree search across 180 degrees, two-cell DDA skip tolerance, five-metre minimum semantic
+path by default (1.2 m in our indoor integration), 30-degree maximum target disparity,
+four-sample weighted heading smoothing, one-second
+validity, and median-based branch detection. Its result only biases the local A* goal; it cannot
+override an occupied LiDAR cell or authorize unknown space. Detected surface transitions are
+included with spoken steering, and semantic headings/branches are exposed in the debug panel.
+
+The Unity-specific portions were intentionally replaced rather than copied: Sentis layer
+scheduling became asynchronous Vision/Core ML inference, Unity transforms became ARKit camera
+transforms, textures/compute-shader display became the Expo debug overlay, and recorded clips
+became iOS text-to-speech. Mobilio's image-only fallback is unnecessary because this app retains
+LiDAR sector guidance whenever the world-grid route is uncertain. Road and curb are also stricter
+than upstream: neither is walkable without an explicit future crossing mode. Cached relative
+headings are invalidated when the phone moves or turns.
+
+The upstream revision inspected is `9dd54b80e95a48a95bde9d405ce6e632d66fbff9`.
+`Navigation.cs` also implements GPS waypoint selection and calls an unpublished `WebClient`
+for routes/intersections; `GPSData.cs` depends on unpublished compass/declination components.
+Those destination-routing services and Mobilio's trained weights are not available in this
+repository and are not implemented by this local indoor port. Spatial audio clips are also
+absent; the app uses its existing spoken speaker guidance. This is an adaptation of the published
+perception/avoidance algorithms, not a complete reproduction of the research application.
+
+Run the native algorithm regression checks on macOS:
+
+```sh
+xcrun swiftc modules/expo-lidar-vision/ios/MobilioRouteAdvisor.swift modules/expo-lidar-vision/ios/LocalRoutePlanner.swift tests/native/MobilioTests.swift -o /tmp/pathfinder-mobilio-tests
+/tmp/pathfinder-mobilio-tests
+```
 
 The route payload reports `source: "segmented-path"` only when enough current semantic and LiDAR
 evidence overlap. Otherwise it reports `source: "lidar-route"`. Semantic evidence expires after

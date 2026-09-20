@@ -135,14 +135,15 @@ final class LidarSession: NSObject, ARSessionDelegate {
         maxDimension: maxDimension,
         quality: quality,
         personMask: nil,
+        surfaceMask: nil,
         includeDebugMetadata: false
       )
     }
   }
 
-  /// Returns a lightweight preview frame with the same person mask used by the
-  /// obstacle pipeline composited in magenta. This is intentionally separate
-  /// from captureFrame so scene-description uploads always receive a clean image.
+  /// Returns a lightweight preview frame with the same semantic masks used by
+  /// the planner. Walkable surfaces are blue and obstacles are red. This stays
+  /// separate from captureFrame so scene-description uploads receive a clean image.
   func captureDebugFrame(maxDimension: Double, quality: Double) throws -> Payload {
     try processingQueue.sync {
       guard isRunning, let frame = latestFrame else {
@@ -152,7 +153,8 @@ final class LidarSession: NSObject, ARSessionDelegate {
         frame,
         maxDimension: maxDimension,
         quality: quality,
-        personMask: processor.currentPersonMask(),
+        personMask: nil,
+        surfaceMask: depthDebugMask(for: frame),
         includeDebugMetadata: true
       )
     }
@@ -163,10 +165,14 @@ final class LidarSession: NSObject, ARSessionDelegate {
     maxDimension: Double,
     quality: Double,
     personMask: PersonMask?,
+    surfaceMask: WalkableSurfaceMask?,
     includeDebugMetadata: Bool
   ) throws -> Payload {
     // capturedImage is landscape-right; rotate so the image is upright in portrait.
     var image = normalizedOrigin(CIImage(cvPixelBuffer: frame.capturedImage).oriented(.right))
+    if let surfaceMask {
+      image = applyingSurfaceOverlay(to: image, mask: surfaceMask)
+    }
     if let personMask {
       image = applyingPersonOverlay(to: image, mask: personMask)
     }
@@ -192,17 +198,112 @@ final class LidarSession: NSObject, ARSessionDelegate {
     ]
     if includeDebugMetadata {
       payload["segmentationAvailable"] = personMask != nil
+      payload["pathSegmentationAvailable"] = false
+      payload["floorDepthAvailable"] = surfaceMask != nil
       payload["personDetected"] = personMask?.containsPerson ?? false
     }
     return payload
   }
 
+  /// Labels the actual depth pixels from this preview frame. The mask shares
+  /// the captured camera's native orientation, then both rotate together.
+  private func depthDebugMask(for frame: ARFrame) -> WalkableSurfaceMask? {
+    guard let floorHeight, case .normal = frame.camera.trackingState,
+          let data = frame.smoothedSceneDepth ?? frame.sceneDepth,
+          let confidence = data.confidenceMap else { return nil }
+    let depth = data.depthMap
+    CVPixelBufferLockBaseAddress(depth, .readOnly)
+    CVPixelBufferLockBaseAddress(confidence, .readOnly)
+    defer {
+      CVPixelBufferUnlockBaseAddress(depth, .readOnly)
+      CVPixelBufferUnlockBaseAddress(confidence, .readOnly)
+    }
+    guard let depthBase = CVPixelBufferGetBaseAddress(depth),
+          let confidenceBase = CVPixelBufferGetBaseAddress(confidence) else { return nil }
+    let width = CVPixelBufferGetWidth(depth), height = CVPixelBufferGetHeight(depth)
+    guard CVPixelBufferGetWidth(confidence) == width,
+          CVPixelBufferGetHeight(confidence) == height else { return nil }
+    let intrinsics = frame.camera.intrinsics
+    let sx = Float(width) / Float(frame.camera.imageResolution.width)
+    let sy = Float(height) / Float(frame.camera.imageResolution.height)
+    let fx = intrinsics.columns.0.x * sx, fy = intrinsics.columns.1.y * sy
+    let cx = intrinsics.columns.2.x * sx, cy = intrinsics.columns.2.y * sy
+    guard fx > 0, fy > 0 else { return nil }
+    var labels = [UInt8](repeating: 0, count: width * height)
+    for y in 0..<height {
+      let row = depthBase.advanced(by: y * CVPixelBufferGetBytesPerRow(depth)).assumingMemoryBound(to: Float.self)
+      let confidenceRow = confidenceBase.advanced(by: y * CVPixelBufferGetBytesPerRow(confidence)).assumingMemoryBound(to: UInt8.self)
+      for x in 0..<width {
+        let d = row[x]
+        guard d.isFinite, d >= 0.15, d <= Float(options.maximumDistanceM),
+              confidenceRow[x] >= options.minimumConfidence else { continue }
+        let world = frame.camera.transform * SIMD4<Float>((Float(x) - cx) * d / fx, -(Float(y) - cy) * d / fy, -d, 1)
+        let heightAboveFloor = world.y - floorHeight
+        if abs(heightAboveFloor) < 0.08 {
+          labels[y * width + x] = WalkableSurfaceClass.covering.rawValue
+        } else if heightAboveFloor > 0.08 && heightAboveFloor < 2 {
+          labels[y * width + x] = WalkableSurfaceClass.curb.rawValue
+        }
+      }
+    }
+    return WalkableSurfaceMask(labels: labels, width: width, height: height, timestamp: frame.timestamp)
+  }
+
   private func applyingPersonOverlay(to cameraImage: CIImage, mask: PersonMask) -> CIImage {
-    let maskData = Data(mask.pixels)
+    applyingMaskOverlay(
+      to: cameraImage,
+      pixels: mask.pixels,
+      width: mask.width,
+      height: mask.height,
+      color: CIColor(red: 1, green: 0.04, blue: 0.05, alpha: 0.68)
+    )
+  }
+
+  private func applyingSurfaceOverlay(
+    to cameraImage: CIImage,
+    mask: WalkableSurfaceMask
+  ) -> CIImage {
+    var walkable = [UInt8](repeating: 0, count: mask.labels.count)
+    var blocked = [UInt8](repeating: 0, count: mask.labels.count)
+    for (index, label) in mask.labels.enumerated() {
+      guard let surfaceClass = WalkableSurfaceClass(rawValue: label),
+            let traversability = surfaceClass.traversability else { continue }
+      if traversability > 0 {
+        walkable[index] = UInt8(clamping: Int(145 + traversability * 90))
+      } else if traversability < 0 {
+        blocked[index] = 235
+      }
+    }
+
+    var result = applyingMaskOverlay(
+      to: cameraImage,
+      pixels: walkable,
+      width: mask.width,
+      height: mask.height,
+      color: CIColor(red: 0.06, green: 0.36, blue: 1, alpha: 0.42)
+    )
+    result = applyingMaskOverlay(
+      to: result,
+      pixels: blocked,
+      width: mask.width,
+      height: mask.height,
+      color: CIColor(red: 1, green: 0.04, blue: 0.05, alpha: 0.54)
+    )
+    return result
+  }
+
+  private func applyingMaskOverlay(
+    to cameraImage: CIImage,
+    pixels: [UInt8],
+    width: Int,
+    height: Int,
+    color: CIColor
+  ) -> CIImage {
+    let maskData = Data(pixels)
     var maskImage = CIImage(
       bitmapData: maskData,
-      bytesPerRow: mask.width,
-      size: CGSize(width: mask.width, height: mask.height),
+      bytesPerRow: width,
+      size: CGSize(width: width, height: height),
       format: .L8,
       colorSpace: CGColorSpaceCreateDeviceGray()
     )
@@ -214,13 +315,11 @@ final class LidarSession: NSObject, ARSessionDelegate {
       .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
       .cropped(to: cameraImage.extent)
 
-    let personColor = CIImage(
-      color: CIColor(red: 1, green: 0.08, blue: 0.48, alpha: 0.62)
-    ).cropped(to: cameraImage.extent)
+    let overlayColor = CIImage(color: color).cropped(to: cameraImage.extent)
     let transparent = CIImage(
       color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)
     ).cropped(to: cameraImage.extent)
-    let overlay = personColor.applyingFilter(
+    let overlay = overlayColor.applyingFilter(
       "CIBlendWithMask",
       parameters: [
         kCIInputBackgroundImageKey: transparent,
