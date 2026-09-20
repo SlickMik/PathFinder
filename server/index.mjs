@@ -175,10 +175,9 @@ function sanitizeHistory(history) {
     .map((turn) => ({ role: turn.role, content: turn.content.slice(0, 600) }));
 }
 
-async function companionChat({ text, history, events, imageBase64, mimeType, lidar }) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-  const upstreamStart = Date.now();
+// --- request body builders (shared by streaming + non-streaming paths) ----
+
+function companionRequestBody({ text, history, events, imageBase64, mimeType, lidar }) {
   const eventsText =
     Array.isArray(events) && events.length > 0
       ? `\nRecent journey moments (you may reference these naturally):\n${events
@@ -195,46 +194,52 @@ async function companionChat({ text, history, events, imageBase64, mimeType, lid
       image_url: { url: `data:${mimeType};base64,${imageBase64}` },
     });
   }
-  try {
-    const response = await fetch(BASETEN_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${BASETEN_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        // Vision turns go to the fastest GPU model; text-only chat keeps the
-        // more conversational model.
-        model: imageBase64 ? FAST_VISION_MODEL : COMPANION_MODEL,
-        temperature: 0.7,
-        max_tokens: 90,
-        messages: [
-          { role: 'system', content: COMPANION_PROMPT },
-          ...sanitizeHistory(history),
-          { role: 'user', content: userContent },
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '');
-      throw Object.assign(
-        new Error(`Baseten error ${response.status}: ${detail.slice(0, 300)}`),
-        { status: 502 },
-      );
-    }
-
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content?.trim();
-    if (!reply) throw Object.assign(new Error('Empty model response.'), { status: 502 });
-    return { reply, usage: data.usage ?? null, upstreamMs: Date.now() - upstreamStart };
-  } finally {
-    clearTimeout(timer);
-  }
+  return {
+    // Vision turns go to the fastest GPU model; text-only chat keeps the
+    // more conversational model.
+    model: imageBase64 ? FAST_VISION_MODEL : COMPANION_MODEL,
+    temperature: 0.7,
+    max_tokens: 90,
+    messages: [
+      { role: 'system', content: COMPANION_PROMPT },
+      ...sanitizeHistory(history),
+      { role: 'user', content: userContent },
+    ],
+  };
 }
 
-async function describeScene({ imageBase64, mimeType, lidar }) {
+function describeRequestBody({ imageBase64, mimeType, lidar }) {
+  return {
+    model: MODEL,
+    temperature: 0.2,
+    max_tokens: 160,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `${lidarContextText(lidar)}\n\nDescribe this scene for the pedestrian now.`,
+          },
+          {
+            type: 'image_url',
+            image_url: { url: `data:${mimeType};base64,${imageBase64}` },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+// One Baseten call. When onDelta is given, streams SSE token deltas to it as
+// they arrive (Baseten supports `stream: true` on /v1/chat/completions); the
+// returned `content` is the full concatenated reply either way. onDelta lets
+// the proxy forward tokens to the client the moment they're generated, so the
+// pedestrian hears the first sentence ~1s in instead of waiting for the whole
+// reply.
+async function callBaseten(body, onDelta) {
+  const streaming = typeof onDelta === 'function';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   const upstreamStart = Date.now();
@@ -246,27 +251,7 @@ async function describeScene({ imageBase64, mimeType, lidar }) {
         Authorization: `Bearer ${BASETEN_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0.2,
-        max_tokens: 160,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `${lidarContextText(lidar)}\n\nDescribe this scene for the pedestrian now.`,
-              },
-              {
-                type: 'image_url',
-                image_url: { url: `data:${mimeType};base64,${imageBase64}` },
-              },
-            ],
-          },
-        ],
-      }),
+      body: JSON.stringify({ ...body, stream: streaming }),
     });
 
     if (!response.ok) {
@@ -277,12 +262,89 @@ async function describeScene({ imageBase64, mimeType, lidar }) {
       );
     }
 
-    const data = await response.json();
-    const description = data.choices?.[0]?.message?.content?.trim();
-    if (!description) throw Object.assign(new Error('Empty model response.'), { status: 502 });
-    return { description, usage: data.usage ?? null, upstreamMs: Date.now() - upstreamStart };
+    if (!streaming) {
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content?.trim();
+      if (!content) throw Object.assign(new Error('Empty model response.'), { status: 502 });
+      return { content, usage: data.usage ?? null, upstreamMs: Date.now() - upstreamStart };
+    }
+
+    // Parse the SSE stream: `data: {json}\n\n`, terminated by `data: [DONE]`.
+    // Chunks are Uint8Arrays whose .toString() yields comma-joined bytes, so
+    // decode with TextDecoder and split on newlines ourselves.
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let full = '';
+    let usage = null;
+    for await (const chunk of response.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let parsed;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (parsed.usage) usage = parsed.usage;
+        const delta = parsed.choices?.[0]?.delta?.content;
+        if (delta) {
+          full += delta;
+          onDelta(delta);
+        }
+      }
+    }
+    const content = full.trim();
+    if (!content) throw Object.assign(new Error('Empty model response.'), { status: 502 });
+    return { content, usage, upstreamMs: Date.now() - upstreamStart };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function companionChat(opts) {
+  const { content, usage, upstreamMs } = await callBaseten(companionRequestBody(opts), null);
+  return { reply: content, usage, upstreamMs };
+}
+
+async function describeScene(opts) {
+  const { content, usage, upstreamMs } = await callBaseten(describeRequestBody(opts), null);
+  return { description: content, usage, upstreamMs };
+}
+
+// Streams a Baseten completion to the client as SSE: one `data: {"delta":...}`
+// event per token, terminated by `data: [DONE]`. The proxy never buffers the
+// whole reply — each token is forwarded the instant Baseten emits it, which is
+// what lets on-device TTS start speaking the first sentence before the model
+// has finished generating the rest.
+async function streamReply(res, requestBody, started, label) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  try {
+    const { content, usage, upstreamMs } = await callBaseten(requestBody, (delta) => {
+      res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+    });
+    res.write('data: [DONE]\n\n');
+    res.end();
+    const totalMs = Date.now() - started;
+    console.log(
+      `[${label}] stream ok total=${totalMs}ms upstream=${upstreamMs}ms overhead=${totalMs - upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'} reply="${content.slice(0, 80)}"`,
+    );
+  } catch (error) {
+    // Match the non-streaming path: send a generic message to the client and
+    // keep the raw upstream detail server-side only (error.message can contain
+    // the full Baseten response body, which we must not leak to the app).
+    res.write(`data: ${JSON.stringify({ error: 'Request failed.' })}\n\n`);
+    res.end();
+    console.error(`[${label}] stream fail ${Date.now() - started}ms: ${error.message}`);
   }
 }
 
@@ -315,14 +377,18 @@ const server = http.createServer(async (req, res) => {
       if (typeof text !== 'string' || !text.trim()) {
         return send(res, 400, { error: 'text is required.' });
       }
-      const { reply, usage, upstreamMs } = await companionChat({
+      const opts = {
         text: text.slice(0, 1000),
         history,
         events,
         imageBase64: typeof imageBase64 === 'string' ? imageBase64 : null,
         mimeType,
         lidar,
-      });
+      };
+      if (body.stream) {
+        return streamReply(res, companionRequestBody(opts), started, 'companion');
+      }
+      const { reply, usage, upstreamMs } = await companionChat(opts);
       const totalMs = Date.now() - started;
       res.setHeader('Server-Timing', `upstream;dur=${upstreamMs}, proxy;dur=${totalMs - upstreamMs}`);
       console.log(
@@ -335,14 +401,13 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, { error: 'imageBase64 is required.' });
     }
 
+    if (body.stream) {
+      return streamReply(res, describeRequestBody({ imageBase64, mimeType, lidar }), started, 'describe-scene');
+    }
     const { description, usage, upstreamMs } = await describeScene({ imageBase64, mimeType, lidar });
-
-    // Proxy overhead = everything we add on top of the model call (parsing,
-    // validation, serialization). Budget: < 15 ms.
     const totalMs = Date.now() - started;
     const overheadMs = totalMs - upstreamMs;
     res.setHeader('Server-Timing', `upstream;dur=${upstreamMs}, proxy;dur=${overheadMs}`);
-    // Log request metadata only — never the frame, LiDAR data, or description.
     console.log(
       `[describe-scene] ok total=${totalMs}ms upstream=${upstreamMs}ms overhead=${overheadMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
     );

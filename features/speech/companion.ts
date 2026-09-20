@@ -1,5 +1,5 @@
 import { ExpoLidarVision } from '../../modules/expo-lidar-vision';
-import { compactLidarContext } from './sceneDescriber';
+import { compactLidarContext, streamSSE } from './sceneDescriber';
 import type { AlertState, NavigationGuidance, ObstacleSnapshot } from '../scanning/types';
 
 // Companion mode: turns the journey into a running conversation with a warm
@@ -28,6 +28,10 @@ type CompanionOptions = {
   guidance?: NavigationGuidance | null;
   events?: string[];
   withFrame?: boolean;
+  // When set, the reply is streamed token-by-token: each delta is passed to
+  // onDelta the moment it arrives so on-device TTS can start speaking the
+  // first sentence before the model finishes the rest.
+  onDelta?: (delta: string) => void;
 };
 
 // Sends one conversational turn (optionally with a fresh camera frame) and
@@ -41,47 +45,54 @@ export function companionSay(text: string, options: CompanionOptions = {}): Prom
 
 async function requestReply(
   text: string,
-  { snapshot = null, alert = null, guidance = null, events = [], withFrame = false }: CompanionOptions,
+  {
+    snapshot = null,
+    alert = null,
+    guidance = null,
+    events = [],
+    withFrame = false,
+    onDelta,
+  }: CompanionOptions,
 ): Promise<string> {
   if (!COMPANION_URL) throw new Error('Companion backend is not configured.');
-  console.log(`[companion] POST ${COMPANION_URL} (frame=${withFrame})`);
+  console.log(`[companion] POST ${COMPANION_URL} (frame=${withFrame}, stream=${!!onDelta})`);
 
   // 512px halves the vision-token count vs 768px — fastest useful size.
   const frame = withFrame ? await ExpoLidarVision.captureFrame(512, 0.5) : null;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(APP_SECRET ? { 'x-app-secret': APP_SECRET } : {}),
+  };
+  const lidar = {
+    ...(compactLidarContext(snapshot) ?? {}),
+    alert: alert ? { risk: alert.risk, direction: alert.direction } : null,
+    guidance:
+      guidance && guidance.instruction !== 'hold'
+        ? {
+            instruction: guidance.instruction,
+            clearanceM: guidance.clearanceM,
+            openingWidthM: guidance.openingWidthM,
+            confidence: guidance.confidence,
+            source: guidance.source,
+          }
+        : null,
+  };
+  const body = {
+    text,
+    history,
+    events: events.slice(-6),
+    lidar,
+    ...(frame ? { imageBase64: frame.base64, mimeType: 'image/jpeg' } : {}),
+    // Streaming: ask the proxy to forward tokens as SSE so on-device TTS can
+    // begin at the first sentence. Without onDelta we keep the simple JSON
+    // round-trip (one buffered response).
+    ...(onDelta ? { stream: true } : {}),
+  };
 
   try {
-    const response = await fetch(COMPANION_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(APP_SECRET ? { 'x-app-secret': APP_SECRET } : {}),
-      },
-      body: JSON.stringify({
-        text,
-        history,
-        events: events.slice(-6),
-        lidar: {
-          ...(compactLidarContext(snapshot) ?? {}),
-          alert: alert ? { risk: alert.risk, direction: alert.direction } : null,
-          guidance:
-            guidance && guidance.instruction !== 'hold'
-              ? {
-                  instruction: guidance.instruction,
-                  clearanceM: guidance.clearanceM,
-                  openingWidthM: guidance.openingWidthM,
-                  confidence: guidance.confidence,
-                  source: guidance.source,
-                }
-              : null,
-        },
-        ...(frame ? { imageBase64: frame.base64, mimeType: 'image/jpeg' } : {}),
-      }),
-    });
-    if (!response.ok) throw new Error(`Companion request failed (${response.status}).`);
-    const { reply } = (await response.json()) as { reply?: string };
+    const reply = onDelta
+      ? await streamSSE(COMPANION_URL, headers, body, { onDelta, timeoutMs: REQUEST_TIMEOUT_MS })
+      : await postReply(COMPANION_URL, headers, body, REQUEST_TIMEOUT_MS);
     if (!reply) throw new Error('No reply returned.');
 
     history.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
@@ -92,6 +103,27 @@ async function requestReply(
       throw new Error('Companion timed out.');
     }
     throw error;
+  }
+}
+
+async function postReply(
+  url: string,
+  headers: Record<string, string>,
+  body: object,
+  timeoutMs: number,
+): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`Companion request failed (${response.status}).`);
+    const { reply } = (await response.json()) as { reply?: string };
+    return reply ?? '';
   } finally {
     clearTimeout(timeout);
   }

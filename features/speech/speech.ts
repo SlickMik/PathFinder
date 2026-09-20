@@ -71,6 +71,116 @@ export function speak(text: string, critical = false): Promise<void> {
   });
 }
 
+// Voice lookup is stable for the process lifetime, so memoize only that. The
+// audio session is deliberately NOT memoized here: useVoiceInput's 'end'
+// handler calls reapplyAudioMode() (which nulls `audioReady`) and then
+// synchronously fires the transcript callback into askCompanion. Each streamed
+// turn must therefore await ensureAudioMode() fresh, or the first sentence can
+// be enqueued while the session is still in record mode — quiet or routed to
+// the earpiece. The old speak() path awaited ensureAudioMode() every call; we
+// preserve that invariant per stream.
+let voiceResolved: Promise<void> | null = null;
+function ensureVoiceResolved(): Promise<void> {
+  voiceResolved ??= (async () => {
+    if (preferredVoice === undefined) preferredVoice = await resolveVoice();
+  })();
+  return voiceResolved;
+}
+
+export type SpeakStream = {
+  // Feed token deltas as they arrive; completed sentences are enqueued on the
+  // synthesizer immediately. Text without terminal punctuation is buffered.
+  push(text: string): void;
+  // Call once the stream is exhausted; flushes any trailing text and resolves
+  // when every enqueued utterance has finished (or been stopped).
+  done(): Promise<void>;
+};
+
+// Incremental speech for streamed replies. expo-speech (AVSpeechSynthesizer)
+// queues utterances natively, so each sentence is spoken the instant it is
+// complete — the pedestrian hears the first sentence ~1s after asking instead
+// of waiting for the whole reply to generate. guard() is consulted before each
+// enqueue: returning false drops that sentence so a streamed reply yields to a
+// higher-priority local alert instead of resuming over it.
+export function speakStream(guard?: () => boolean): SpeakStream {
+  let buffer = '';
+  let finished = false;
+  let pending = 0;
+  let ready = false;
+  const waiting: string[] = [];
+  const { promise: donePromise, resolve: resolveDone } = Promise.withResolvers<void>();
+
+  const checkEnd = () => {
+    if (finished && ready && waiting.length === 0 && pending <= 0) resolveDone();
+  };
+
+  const enqueue = (text: string) => {
+    const sentence = text.trim();
+    if (!sentence) return;
+    if (guard && !guard()) return;
+    pending += 1;
+    Speech.speak(sentence, {
+      rate: 0.98,
+      pitch: 1.0,
+      language: 'en-US',
+      ...(preferredVoice ? { voice: preferredVoice } : {}),
+      onDone: () => {
+        pending -= 1;
+        checkEnd();
+      },
+      onStopped: () => {
+        pending -= 1;
+        checkEnd();
+      },
+      onError: () => {
+        pending -= 1;
+        checkEnd();
+      },
+    });
+  };
+
+  void (async () => {
+    // Await the (possibly just-reapplied) audio session fresh each stream,
+    // then the memoized voice lookup.
+    await ensureAudioMode();
+    await ensureVoiceResolved();
+    ready = true;
+    for (const s of waiting) enqueue(s);
+    waiting.length = 0;
+    checkEnd();
+  })();
+
+  return {
+    push(text) {
+      if (finished) return;
+      buffer += text;
+      // Emit at each sentence boundary: text up to and including terminal
+      // punctuation, but ONLY when the punctuation is followed by real
+      // whitespace — otherwise "2.1" or "1.3 m" would split mid-number and
+      // TTS would say "the 2" then "1 meter clearance" as separate utterances.
+      // A trailing fragment with no following whitespace is flushed by done().
+      let match;
+      while ((match = buffer.match(/^[\s\S]*?[.!?]+\s+/))) {
+        const sentence = match[0];
+        buffer = buffer.slice(sentence.length);
+        if (!ready) waiting.push(sentence);
+        else enqueue(sentence);
+      }
+    },
+    done() {
+      finished = true;
+      const rest = buffer;
+      buffer = '';
+      if (rest.trim()) {
+        if (!ready) waiting.push(rest);
+        else enqueue(rest);
+      }
+      checkEnd();
+      return donePromise;
+    },
+  };
+}
+
 export function stopSpeaking(): Promise<void> {
   return Speech.stop();
 }

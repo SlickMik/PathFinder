@@ -6,7 +6,7 @@ import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
 import { companionSay, resetCompanion } from '../speech/companion';
 import { describeCurrentScene } from '../speech/sceneDescriber';
-import { speak, stopSpeaking } from '../speech/speech';
+import { speak, speakStream, stopSpeaking } from '../speech/speech';
 import { emitRiskHaptic, hapticIntervalMs } from './haptics';
 import { safetyEnvelopeForSpeed } from './motionSafety';
 import {
@@ -49,6 +49,10 @@ export function useLidarScanner() {
   // deterministic local alerts still take priority over all of it.
   const companionRef = useRef(true);
   const [companion, setCompanionState] = useState(true);
+  // Spoken obstacle/guidance alerts ("Stop", "Obstacle left"). OFF by default
+  // so they don't talk over the companion — haptics always stay on regardless.
+  const alertVoiceRef = useRef(false);
+  const [alertVoice, setAlertVoiceState] = useState(false);
   const lastAnnouncementRef = useRef({ text: '', timestamp: 0 });
   const lastGuidanceSpeechRef = useRef({ instruction: 'hold', timestamp: 0 });
   const lastAlertSpeechRef = useRef({ text: '', timestamp: 0 });
@@ -92,6 +96,7 @@ export function useLidarScanner() {
 
   const speakGuidance = useCallback(
     (nextGuidance: NavigationGuidance, previousGuidance: NavigationGuidance) => {
+      if (!alertVoiceRef.current) return;
       if (!nextGuidance.phrase || nextGuidance.instruction === 'hold') return;
 
       const now = Date.now();
@@ -157,7 +162,7 @@ export function useLidarScanner() {
       setStatus(viewValid ? 'scanning' : 'paused');
       if (viewValid) setErrorMessage(null);
 
-      if (nextAlert.announcement) {
+      if (nextAlert.announcement && alertVoiceRef.current) {
         // Alert speech pacing. Without this, sector flapping (left/center)
         // re-announces at up to 10 Hz and critical alerts interrupt
         // themselves constantly.
@@ -327,18 +332,22 @@ export function useLidarScanner() {
     if (!active) return;
     try {
       announce('Describing scene.');
+      // Stream the description so the first sentence is spoken as soon as the
+      // model produces it, instead of after the whole reply returns.
+      const speech = speakStream();
       const text = companionRef.current
         ? await companionSay('What do you see around us right now?', {
             snapshot: snapshotRef.current,
             withFrame: true,
+            onDelta: (delta) => speech.push(delta),
           })
-        : await describeCurrentScene(snapshotRef.current);
-      announce(text, true);
+        : await describeCurrentScene(snapshotRef.current, (delta) => speech.push(delta));
+      await speech.done();
+      console.log(`[describe-scene] reply: "${text}"`);
     } catch (error) {
       announce(error instanceof Error ? error.message : 'Unable to describe the scene.');
     }
   }, [active, announce]);
-
   const askCompanion = useCallback(
     async (text: string) => {
       console.log(`[companion] user said: "${text}"`);
@@ -349,6 +358,12 @@ export function useLidarScanner() {
         const recentEvents = journeyEventsRef.current
           .filter((entry) => now - entry.at < 90_000)
           .map((entry) => `${Math.round((now - entry.at) / 1000)}s ago: ${entry.event}`);
+        // Stream the reply into incremental TTS: the first sentence starts
+        // speaking ~1s after the user stops talking, while the model is still
+        // generating the rest. The guard yields to a critical local obstacle
+        // alert — if one fires mid-reply, further sentences are dropped so the
+        // companion does not resume talking over a STOP alert.
+        const speech = speakStream(() => alertRef.current.risk !== 'critical');
         const reply = await companionSay(text, {
           snapshot: snapshotRef.current,
           alert: alertRef.current,
@@ -356,11 +371,10 @@ export function useLidarScanner() {
           events: recentEvents,
           // Walking companion: every voice turn gets fresh eyes while scanning.
           withFrame: active,
+          onDelta: (delta) => speech.push(delta),
         });
+        await speech.done();
         console.log(`[companion] reply: "${reply}"`);
-        // Await the spoken reply so hands-free mode can reopen the mic
-        // only after the companion finishes talking (no self-echo).
-        await speak(reply, true);
       } catch (error) {
         console.warn('[companion] request failed:', error);
         announce('Companion is unavailable right now.');
@@ -368,6 +382,13 @@ export function useLidarScanner() {
     },
     [active, announce],
   );
+
+  const toggleAlertVoice = useCallback(() => {
+    const next = !alertVoiceRef.current;
+    alertVoiceRef.current = next;
+    setAlertVoiceState(next);
+    void speak(next ? 'Alert voice on.' : 'Alert voice off. Haptics stay on.', true);
+  }, []);
 
   const toggleCompanion = useCallback(() => {
     const next = !companionRef.current;
@@ -388,6 +409,8 @@ export function useLidarScanner() {
 
   return {
     active,
+    alertVoice,
+    toggleAlertVoice,
     askCompanion,
     companion,
     toggleCompanion,

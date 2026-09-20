@@ -52,45 +52,181 @@ let inFlight: Promise<string> | null = null;
 // context, to the trusted scene-description proxy (server/index.mjs), which
 // holds the Baseten API key. Frames are only sent on explicit request, and
 // repeated requests coalesce onto the one already in flight.
-export function describeCurrentScene(snapshot: ObstacleSnapshot | null = null): Promise<string> {
-  inFlight ??= requestDescription(snapshot).finally(() => {
+export function describeCurrentScene(
+  snapshot: ObstacleSnapshot | null = null,
+  onDelta?: (delta: string) => void,
+): Promise<string> {
+  inFlight ??= requestDescription(snapshot, onDelta).finally(() => {
     inFlight = null;
   });
   return inFlight;
 }
 
-async function requestDescription(snapshot: ObstacleSnapshot | null): Promise<string> {
+async function requestDescription(
+  snapshot: ObstacleSnapshot | null,
+  onDelta?: (delta: string) => void,
+): Promise<string> {
   if (!SCENE_URL) throw new Error('Scene description backend is not configured.');
 
   // 512px halves the vision-token count vs 768px — fastest useful size.
   const frame = await ExpoLidarVision.captureFrame(512, 0.5);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(APP_SECRET ? { 'x-app-secret': APP_SECRET } : {}),
+  };
+  const body = {
+    imageBase64: frame.base64,
+    mimeType: 'image/jpeg',
+    lidar: compactLidarContext(snapshot),
+    // When streaming, ask the proxy to stream tokens back as SSE so on-device
+    // TTS can start at the first sentence instead of after the full reply.
+    ...(onDelta ? { stream: true } : {}),
+  };
   try {
-    const response = await fetch(SCENE_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(APP_SECRET ? { 'x-app-secret': APP_SECRET } : {}),
-      },
-      body: JSON.stringify({
-        imageBase64: frame.base64,
-        mimeType: 'image/jpeg',
-        lidar: compactLidarContext(snapshot),
-      }),
-    });
-    if (!response.ok) throw new Error(`Scene description failed (${response.status}).`);
-    const { description } = (await response.json()) as { description?: string };
-    if (!description) throw new Error('No description returned.');
-    return description;
+    const text = onDelta
+      ? await streamSSE(SCENE_URL, headers, body, { onDelta, timeoutMs: REQUEST_TIMEOUT_MS })
+      : await postJSON(SCENE_URL, headers, body, REQUEST_TIMEOUT_MS);
+    if (!text) throw new Error('No description returned.');
+    return text;
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
       throw new Error('Scene description timed out.');
     }
     throw error;
+  }
+}
+
+// --- streaming helpers (shared with companion.ts) --------------------------
+
+async function postJSON(url: string, headers: Record<string, string>, body: object, timeoutMs: number): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      signal: controller.signal,
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`Request failed (${response.status}).`);
+    const json = (await response.json()) as { description?: string; reply?: string };
+    return json.description ?? json.reply ?? '';
   } finally {
     clearTimeout(timeout);
   }
+}
+
+type StreamHandlers = { onDelta: (delta: string) => void; timeoutMs?: number };
+
+export type SseParseResult = {
+  deltas: string[];
+  error: string | null;
+  done: boolean;
+  nextOffset: number;
+};
+
+// Pure SSE parser. Given the full responseText accumulated so far and the byte
+// offset already consumed, returns the delta/error events in any newly complete
+// `data:` lines plus the offset to consume up to next. Only newline-terminated
+// lines are processed; a trailing partial line is left (nextOffset points just
+// past the last newline) so it is re-examined once more bytes arrive. Extracted
+// from the XHR plumbing so the offset-slicing logic is unit-testable without a
+// device — that logic is the riskiest part and cannot be exercised on-device here.
+export function parseSseChunk(text: string, startOffset: number): SseParseResult {
+  const deltas: string[] = [];
+  let error: string | null = null;
+  let done = false;
+  const tail = text.slice(startOffset);
+  const lastNl = tail.lastIndexOf('\n');
+  if (lastNl < 0) return { deltas, error, done, nextOffset: startOffset };
+  const complete = tail.slice(0, lastNl);
+  const nextOffset = startOffset + lastNl + 1;
+  for (const line of complete.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const payload = trimmed.slice(5).trim();
+    if (payload === '[DONE]') {
+      done = true;
+      continue;
+    }
+    let parsed: { delta?: string; error?: string };
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (typeof parsed.delta === 'string') deltas.push(parsed.delta);
+    if (typeof parsed.error === 'string') error = parsed.error;
+  }
+  return { deltas, error, done, nextOffset };
+}
+
+// POSTs `body` to `url` and streams the Server-Sent Events response, invoking
+// onDelta for each `data: {"delta": ...}` event. Resolves with the full reply.
+//
+// Uses XMLHttpRequest on purpose: React Native's fetch (RN 0.86) does not
+// expose a streaming response body — `response.body` is null on device — so
+// the SSE tokens would be buffered until the whole reply arrives and the
+// streaming win is lost. XHR's `onprogress` fires as bytes arrive and
+// `responseText` grows incrementally, which is what lets us parse each token
+// the moment the proxy forwards it.
+export function streamSSE(
+  url: string,
+  headers: Record<string, string>,
+  body: object,
+  { onDelta, timeoutMs = 15_000 }: StreamHandlers,
+): Promise<string> {
+  const { promise, resolve, reject } = Promise.withResolvers<string>();
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', url);
+  for (const [key, value] of Object.entries(headers)) xhr.setRequestHeader(key, value);
+  xhr.responseType = 'text';
+  // Native timeout fires `ontimeout` (not `onload`/`onerror`), so the promise
+  // always settles. A manual timer + abort would fire `onabort` instead, which
+  // we also handle below as a backstop.
+  xhr.timeout = timeoutMs;
+
+  let processed = 0; // how far into responseText we've consumed
+  let full = '';
+  let streamError: Error | null = null;
+  let settled = false;
+
+  const settle = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    fn();
+  };
+
+  const pump = () => {
+    const text = xhr.responseText ?? '';
+    if (text.length <= processed) return;
+    const result = parseSseChunk(text, processed);
+    processed = result.nextOffset;
+    for (const delta of result.deltas) {
+      full += delta;
+      onDelta(delta);
+    }
+    if (result.error) streamError = new Error(result.error);
+  };
+
+  const timeoutError = () =>
+    Object.assign(new Error('Stream timed out.'), { name: 'AbortError' });
+
+  xhr.onprogress = pump;
+  xhr.onload = () => {
+    pump();
+    settle(() => {
+      if (streamError) reject(streamError);
+      else if (xhr.status >= 200 && xhr.status < 300) resolve(full);
+      else reject(new Error(`Stream failed (${xhr.status}).`));
+    });
+  };
+  xhr.onerror = () => settle(() => reject(new Error('Stream network error.')));
+  xhr.ontimeout = () => settle(() => reject(timeoutError()));
+  // abort fires when xhr.abort() is called externally or by the runtime; treat
+  // it as a cancellation/timeout so callers do not hang forever.
+  xhr.onabort = () => settle(() => reject(timeoutError()));
+
+  xhr.send(JSON.stringify(body));
+  return promise;
 }

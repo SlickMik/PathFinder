@@ -225,6 +225,21 @@ export default function ScannerScreen() {
 
         <Pressable
           accessibilityRole="button"
+          accessibilityState={{ selected: scanner.alertVoice }}
+          accessibilityLabel={
+            scanner.alertVoice ? 'Turn off spoken alerts' : 'Turn on spoken alerts'
+          }
+          accessibilityHint="Spoken obstacle warnings like Stop and Obstacle left. Vibration alerts always stay on."
+          onPress={() => scanner.toggleAlertVoice()}
+          style={[styles.describe, scanner.alertVoice && styles.companionOn]}
+        >
+          <Text maxFontSizeMultiplier={1.6} style={styles.describeText}>
+            {scanner.alertVoice ? 'Alert voice: on' : 'Alert voice: off'}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          accessibilityRole="button"
           accessibilityState={{ selected: scanner.companion }}
           accessibilityLabel={
             scanner.companion ? 'Turn off companion mode' : 'Turn on companion mode'

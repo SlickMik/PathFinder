@@ -145,5 +145,97 @@ await check('describe-scene: rejects missing image', async () => {
   expect(status === 400, `expected 400, got ${status}`);
 });
 
+// --- streaming (SSE) path --------------------------------------------------
+
+async function streamPost(path, body, timeoutMs = 30_000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const started = Date.now();
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, stream: true }),
+    });
+    if (!res.ok) return { status: res.status, text: await res.text().catch(() => '') };
+    const dec = new TextDecoder();
+    let buf = '';
+    let full = '';
+    let firstDeltaMs = null;
+    let events = 0;
+    let streamError = null;
+    for await (const chunk of res.body) {
+      buf += dec.decode(chunk, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let parsed;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (parsed.delta) {
+          if (firstDeltaMs === null) firstDeltaMs = Date.now() - started;
+          full += parsed.delta;
+          events += 1;
+        }
+        if (parsed.error) streamError = parsed.error;
+      }
+    }
+    return {
+      status: res.status,
+      text: full,
+      firstDeltaMs,
+      totalMs: Date.now() - started,
+      events,
+      streamError,
+      ct: res.headers.get('content-type'),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+await check('companion: streams tokens (SSE)', async () => {
+  const r = await streamPost('/companion', { text: 'what is ahead of me?', history: [], lidar: LIDAR });
+  expect(r.status === 200, `status ${r.status} ${r.text ?? ''}`);
+  expect(r.ct === 'text/event-stream', `content-type ${r.ct}`);
+  expect(r.events > 1, `expected multiple deltas, got ${r.events}`);
+  expect(r.firstDeltaMs !== null, 'no delta arrived');
+  expect(r.text.length > 0, 'empty streamed reply');
+  return `firstDelta=${r.firstDeltaMs}ms total=${r.totalMs}ms events=${r.events}`;
+});
+
+await check('companion: streamed reply stays grounded in LiDAR', async () => {
+  const r = await streamPost('/companion', {
+    text: 'how far is the thing in front of me?',
+    history: [],
+    lidar: LIDAR,
+  });
+  expect(r.status === 200, `status ${r.status}`);
+  expect(/met(er|re)|close|ahead|front|center/i.test(r.text), `not grounded: "${r.text}"`);
+  return `"${r.text.slice(0, 80)}..."`;
+});
+
+await check('describe-scene: streams tokens (SSE)', async () => {
+  const r = await streamPost('/describe-scene', {
+    imageBase64: TINY_JPEG,
+    mimeType: 'image/jpeg',
+    lidar: LIDAR,
+  });
+  expect(r.status === 200, `status ${r.status} ${r.text ?? ''}`);
+  expect(r.ct === 'text/event-stream', `content-type ${r.ct}`);
+  expect(r.events > 1, `expected multiple deltas, got ${r.events}`);
+  expect(r.text.length > 0, 'empty streamed description');
+  return `firstDelta=${r.firstDeltaMs}ms total=${r.totalMs}ms events=${r.events}`;
+});
+
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
