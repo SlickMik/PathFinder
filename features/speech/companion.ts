@@ -26,6 +26,40 @@ export function resetCompanion(): void {
   history.length = 0;
 }
 
+// The conversation is shared across reply brains: a turn answered by OMNI
+// (omniLive.ts) is context for the next Baseten turn and vice versa.
+export function getCompanionHistory(): Turn[] {
+  return [...history];
+}
+
+export function recordCompanionTurn(user: string, reply: string): void {
+  history.push({ role: 'user', content: user }, { role: 'assistant', content: reply });
+  while (history.length > MAX_TURNS) history.splice(0, 2);
+}
+
+// Compact LiDAR context per PLAN.md §8 — sector distances, alert state, and
+// route guidance only; never the raw depth map. Shared with omniLive.ts.
+export function buildLidarPayload(
+  snapshot: ObstacleSnapshot | null,
+  alert: AlertState | null,
+  guidance: NavigationGuidance | null,
+) {
+  return {
+    ...(compactLidarContext(snapshot) ?? {}),
+    alert: alert ? { risk: alert.risk, direction: alert.direction } : null,
+    guidance:
+      guidance && guidance.instruction !== 'hold'
+        ? {
+            instruction: guidance.instruction,
+            clearanceM: guidance.clearanceM,
+            openingWidthM: guidance.openingWidthM,
+            confidence: guidance.confidence,
+            source: guidance.source,
+          }
+        : null,
+  };
+}
+
 type CompanionOptions = {
   snapshot?: ObstacleSnapshot | null;
   alert?: AlertState | null;
@@ -67,20 +101,7 @@ async function requestReply(
     'Content-Type': 'application/json',
     ...(APP_SECRET ? { 'x-app-secret': APP_SECRET } : {}),
   };
-  const lidar = {
-    ...(compactLidarContext(snapshot) ?? {}),
-    alert: alert ? { risk: alert.risk, direction: alert.direction } : null,
-    guidance:
-      guidance && guidance.instruction !== 'hold'
-        ? {
-            instruction: guidance.instruction,
-            clearanceM: guidance.clearanceM,
-            openingWidthM: guidance.openingWidthM,
-            confidence: guidance.confidence,
-            source: guidance.source,
-          }
-        : null,
-  };
+  const lidar = buildLidarPayload(snapshot, alert, guidance);
   const body = {
     text,
     history,

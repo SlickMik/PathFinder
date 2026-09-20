@@ -237,5 +237,68 @@ await check('describe-scene: streams tokens (SSE)', async () => {
 });
 
 
+// --- OMNI Live (optional — exercised only when OMNI_API_KEY is configured) --
+
+const { omni: omniEnabled } = await fetch(`${BASE}/health`).then((r) => r.json());
+
+await check('omni: contract when unconfigured/missing audio', async () => {
+  const { status } = await post('/omni', { lidar: LIDAR });
+  if (!omniEnabled) {
+    expect(status === 503, `expected 503 when off, got ${status}`);
+    return 'disabled → 503 (skipping live checks)';
+  }
+  expect(status === 400, `expected 400 without audio, got ${status}`);
+  return 'enabled → 400 without audioBase64';
+});
+
+if (omniEnabled) {
+  // 0.4s of silence, 16 kHz 16-bit mono WAV built in-memory — no fixtures.
+  const silentWav = (() => {
+    const pcm = Buffer.alloc(16000 * 0.4 * 2);
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0);
+    header.writeUInt32LE(36 + pcm.length, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(1, 22);
+    header.writeUInt32LE(16000, 24);
+    header.writeUInt32LE(32000, 28);
+    header.writeUInt16LE(2, 32);
+    header.writeUInt16LE(16, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(pcm.length, 40);
+    return Buffer.concat([header, pcm]).toString('base64');
+  })();
+
+  await check('omni: full multimodal turn (audio + frame + LiDAR)', async () => {
+    const { status, json, ms } = await post(
+      '/omni',
+      {
+        audioBase64: silentWav,
+        audioMime: 'audio/wav',
+        imageBase64: TINY_JPEG,
+        mimeType: 'image/jpeg',
+        lidar: LIDAR,
+        history: [],
+        events: [],
+      },
+      60_000,
+    );
+    expect(status === 200, `status ${status}`);
+    expect(typeof json.reply === 'string' && json.reply.length > 0, 'empty reply');
+    if (json.audioId) {
+      const audio = await fetch(`${BASE}/omni-audio?id=${json.audioId}`);
+      expect(audio.status === 200, `audio fetch ${audio.status}`);
+      expect(audio.headers.get('content-type') === 'audio/wav', 'not audio/wav');
+      const bytes = Buffer.from(await audio.arrayBuffer());
+      expect(bytes.length > 44 && bytes.toString('ascii', 0, 4) === 'RIFF', 'not a WAV file');
+      return `${ms}ms, reply="${json.reply.slice(0, 60)}...", audio=${bytes.length}B`;
+    }
+    return `${ms}ms, reply="${json.reply.slice(0, 60)}..." (no audio returned)`;
+  });
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

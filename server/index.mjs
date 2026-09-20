@@ -15,6 +15,7 @@
 //   PORT               default: 8787
 
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -41,6 +42,18 @@ const COMPANION_MODEL = process.env.BASETEN_COMPANION_MODEL ?? 'moonshotai/Kimi-
 const FAST_VISION_MODEL = process.env.BASETEN_FAST_VISION_MODEL ?? 'zai-org/GLM-5.3-Flash';
 const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
 const BASETEN_URL = 'https://inference.baseten.co/v1/chat/completions';
+// OMNI Live (Huawei HTN track): ONE Qwen Omni call handles all three
+// modalities together — the user's raw speech (audio), a camera frame
+// (vision), and LiDAR/journey context (language) — and answers with its own
+// natural spoken voice. Accessed through the yibuapi OpenAI-compatible
+// gateway. Optional: without OMNI_API_KEY the app keeps the on-device STT →
+// Baseten → on-device TTS chain.
+const OMNI_API_KEY = process.env.OMNI_API_KEY || null;
+const OMNI_BASE_URL = process.env.OMNI_BASE_URL ?? 'https://yibuapi.com/v1';
+const OMNI_MODEL = process.env.OMNI_MODEL ?? 'qwen3.5-omni-flash';
+const OMNI_VOICE = process.env.OMNI_VOICE ?? 'Cherry';
+// Audio generation is slower than text — give OMNI more headroom.
+const OMNI_TIMEOUT_MS = 35_000;
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // one compressed 768px JPEG fits easily
 const UPSTREAM_TIMEOUT_MS = 25_000;
@@ -381,6 +394,218 @@ async function describeScene(opts) {
   return { description: content, usage, upstreamMs };
 }
 
+// --- OMNI Live: single-call multimodal turn (audio + vision + language) -----
+
+// Retry policy for transient upstream failures: exponential backoff with
+// jitter on 429/5xx/network errors, honouring Retry-After, never a tight
+// loop. Timeouts (AbortError) are not retried — the pedestrian is waiting.
+const MAX_UPSTREAM_RETRIES = Math.max(0, Number(process.env.UPSTREAM_MAX_RETRIES ?? 2));
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function retryDelayMs(attempt, retryAfterS) {
+  if (Number.isFinite(retryAfterS) && retryAfterS > 0) return Math.min(retryAfterS * 1000, 10_000);
+  const base = Math.min(500 * 2 ** attempt, 4_000); // 500ms, 1s, 2s, capped at 4s
+  return Math.round(base * (0.5 + Math.random() * 0.5)); // jitter so clients don't sync up
+}
+
+async function withUpstreamRetries(label, attemptFn) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await attemptFn();
+    } catch (error) {
+      const transient =
+        error.upstreamStatus === 429 ||
+        (error.upstreamStatus >= 500 && error.upstreamStatus <= 599) ||
+        error.networkFailure === true;
+      if (!transient || attempt >= MAX_UPSTREAM_RETRIES) throw error;
+      const delay = retryDelayMs(attempt, error.retryAfterS);
+      console.warn(
+        `[${label}] ${error.upstreamStatus ?? 'network error'} — retry ${attempt + 1}/${MAX_UPSTREAM_RETRIES} in ${delay}ms`,
+      );
+      await sleep(delay);
+    }
+  }
+}
+
+function omniAudioFormat(audioMime) {
+  if (audioMime.includes('wav') || audioMime.includes('caf')) return 'wav';
+  if (audioMime.includes('mp3') || audioMime.includes('mpeg')) return 'mp3';
+  return 'm4a';
+}
+
+// Same journey persona and safety rules as the Baseten companion — the model
+// changes, the guardrails do not. The extra instruction tells OMNI the user's
+// words arrive as audio, not text.
+function omniRequestBody({ audioBase64, audioMime, imageBase64, mimeType, history, events, lidar }) {
+  const eventsText =
+    Array.isArray(events) && events.length > 0
+      ? `\nRecent journey moments (you may reference these naturally):\n${events
+          .slice(-6)
+          .map((event) => `- ${String(event).slice(0, 120)}`)
+          .join('\n')}`
+      : '';
+  const userContent = [
+    {
+      type: 'text',
+      text: `${lidarContextText(lidar)}${eventsText}\n\nThe user is speaking to you in the attached audio. Listen and reply out loud.`,
+    },
+    {
+      type: 'input_audio',
+      input_audio: {
+        data: `data:${audioMime};base64,${audioBase64}`,
+        format: omniAudioFormat(audioMime),
+      },
+    },
+  ];
+  if (imageBase64) {
+    userContent.push({
+      type: 'image_url',
+      image_url: { url: `data:${mimeType};base64,${imageBase64}` },
+    });
+  }
+  return {
+    model: OMNI_MODEL,
+    // Qwen Omni only produces speech on the streaming API.
+    stream: true,
+    stream_options: { include_usage: true },
+    modalities: ['text', 'audio'],
+    audio: { voice: OMNI_VOICE, format: 'wav' },
+    messages: [
+      { role: 'system', content: COMPANION_PROMPT },
+      ...sanitizeHistory(history),
+      { role: 'user', content: userContent },
+    ],
+  };
+}
+
+// Qwen Omni streams reply speech as base64 PCM16 @ 24 kHz mono; wrap it in a
+// WAV header so expo-audio can play it directly. If the upstream ever sends a
+// ready-made WAV container, pass it through untouched.
+function wavFromPcm16(pcm, sampleRate = 24_000) {
+  if (pcm.length >= 4 && pcm.toString('ascii', 0, 4) === 'RIFF') return pcm;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28); // byte rate (16-bit mono)
+  header.writeUInt16LE(2, 32); // block align
+  header.writeUInt16LE(16, 34); // bits per sample
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+// One OMNI streaming call: collects the text deltas, the spoken-reply
+// transcript, and the base64 audio chunks. The reply text prefers the audio
+// transcript (it matches what the voice actually says).
+async function callOmniOnce(body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OMNI_TIMEOUT_MS);
+  const upstreamStart = Date.now();
+  try {
+    let response;
+    try {
+      response = await fetch(`${OMNI_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${OMNI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      if (error?.name !== 'AbortError') error.networkFailure = true;
+      throw error;
+    }
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw Object.assign(new Error(`OMNI error ${response.status}: ${detail.slice(0, 300)}`), {
+        status: response.status === 429 ? 429 : 502,
+        upstreamStatus: response.status,
+        retryAfterS: Number(response.headers.get('retry-after')),
+      });
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let text = '';
+    let transcript = '';
+    const audioChunks = [];
+    let usage = null;
+    for await (const chunk of response.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let parsed;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (parsed.usage) usage = parsed.usage;
+        const delta = parsed.choices?.[0]?.delta;
+        if (!delta) continue;
+        if (typeof delta.content === 'string') text += delta.content;
+        if (typeof delta.audio?.transcript === 'string') transcript += delta.audio.transcript;
+        if (typeof delta.audio?.data === 'string') audioChunks.push(delta.audio.data);
+      }
+    }
+    const reply = (transcript || text).trim();
+    if (!reply && audioChunks.length === 0) {
+      throw Object.assign(new Error('Empty OMNI response.'), { status: 502 });
+    }
+    const pcm = Buffer.from(audioChunks.join(''), 'base64');
+    return {
+      reply,
+      audioWav: pcm.length > 0 ? wavFromPcm16(pcm) : null,
+      usage,
+      upstreamMs: Date.now() - upstreamStart,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const callOmni = (body) => withUpstreamRetries('omni', () => callOmniOnce(body));
+
+// Short-lived store for generated reply audio: POST /omni returns an audioId,
+// the app then plays GET /omni-audio?id=... through expo-audio. Entries are
+// capped and expire quickly — nothing is written to disk.
+const omniAudioStore = new Map();
+const OMNI_AUDIO_TTL_MS = 120_000;
+const OMNI_AUDIO_MAX_ENTRIES = 20;
+
+function stashOmniAudio(wav) {
+  const now = Date.now();
+  for (const [id, entry] of omniAudioStore) {
+    if (entry.expiresAt < now) omniAudioStore.delete(id);
+  }
+  while (omniAudioStore.size >= OMNI_AUDIO_MAX_ENTRIES) {
+    omniAudioStore.delete(omniAudioStore.keys().next().value);
+  }
+  const id = randomUUID();
+  omniAudioStore.set(id, { wav, expiresAt: now + OMNI_AUDIO_TTL_MS });
+  return id;
+}
+
+function takeOmniAudio(id) {
+  const entry = omniAudioStore.get(id);
+  if (!entry || entry.expiresAt < Date.now()) return null;
+  return entry.wav;
+}
+
 // Streams a Baseten completion to the client as SSE: one `data: {"delta":...}`
 // event per token, terminated by `data: [DONE]`. The proxy never buffers the
 // whole reply — each token is forwarded the instant Baseten emits it, which is
@@ -417,9 +642,33 @@ const server = http.createServer(async (req, res) => {
   const ip = req.socket.remoteAddress ?? 'unknown';
 
   if (req.method === 'GET' && req.url === '/health') {
-    return send(res, 200, { ok: true, model: MODEL, companionModel: COMPANION_MODEL });
+    return send(res, 200, {
+      ok: true,
+      model: MODEL,
+      companionModel: COMPANION_MODEL,
+      omni: Boolean(OMNI_API_KEY),
+      omniModel: OMNI_API_KEY ? OMNI_MODEL : null,
+    });
   }
-  if (req.method !== 'POST' || !['/describe-scene', '/companion', '/hazards'].includes(req.url)) {
+  // Serves the spoken OMNI reply generated by a previous POST /omni.
+  if (req.method === 'GET' && req.url?.startsWith('/omni-audio?')) {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    if (SHARED_SECRET && params.get('secret') !== SHARED_SECRET) {
+      return send(res, 401, { error: 'Unauthorized.' });
+    }
+    const wav = takeOmniAudio(params.get('id') ?? '');
+    if (!wav) return send(res, 404, { error: 'Audio expired or not found.' });
+    res.writeHead(200, {
+      'Content-Type': 'audio/wav',
+      'Content-Length': wav.length,
+      'Cache-Control': 'no-store',
+    });
+    return res.end(wav);
+  }
+  if (
+    req.method !== 'POST' ||
+    !['/describe-scene', '/companion', '/hazards', '/omni'].includes(req.url)
+  ) {
     return send(res, 404, { error: 'Not found.' });
   }
   if (SHARED_SECRET && req.headers['x-app-secret'] !== SHARED_SECRET) {
@@ -434,6 +683,32 @@ const server = http.createServer(async (req, res) => {
     const { imageBase64, mimeType = 'image/jpeg', lidar } = body ?? {};
     if (imageBase64 !== undefined && !['image/jpeg', 'image/png'].includes(mimeType)) {
       return send(res, 400, { error: 'Unsupported mimeType.' });
+    }
+
+    if (req.url === '/omni') {
+      if (!OMNI_API_KEY) return send(res, 503, { error: 'OMNI not configured.' });
+      const { audioBase64, audioMime = 'audio/wav', history, events } = body ?? {};
+      if (typeof audioBase64 !== 'string' || audioBase64.length < 100) {
+        return send(res, 400, { error: 'audioBase64 is required.' });
+      }
+      const { reply, audioWav, usage, upstreamMs } = await callOmni(
+        omniRequestBody({
+          audioBase64,
+          audioMime,
+          imageBase64: typeof imageBase64 === 'string' ? imageBase64 : null,
+          mimeType,
+          history,
+          events,
+          lidar,
+        }),
+      );
+      const audioId = audioWav && audioWav.length > 44 ? stashOmniAudio(audioWav) : null;
+      const totalMs = Date.now() - started;
+      res.setHeader('Server-Timing', `upstream;dur=${upstreamMs}, proxy;dur=${totalMs - upstreamMs}`);
+      console.log(
+        `[omni] ok total=${totalMs}ms upstream=${upstreamMs}ms audio=${audioWav?.length ?? 0}B tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+      );
+      return send(res, 200, { reply, audioId });
     }
 
     if (req.url === '/companion') {
@@ -518,7 +793,7 @@ async function warmUpstream() {
 
 server.listen(PORT, () => {
   console.log(
-    `PathFinder scene proxy listening on http://0.0.0.0:${PORT} (describe: ${MODEL}, chat: ${COMPANION_MODEL}, vision: ${FAST_VISION_MODEL})`,
+    `PathFinder scene proxy listening on http://0.0.0.0:${PORT} (describe: ${MODEL}, chat: ${COMPANION_MODEL}, vision: ${FAST_VISION_MODEL}, omni: ${OMNI_API_KEY ? OMNI_MODEL : 'off'})`,
   );
   void warmUpstream();
 });

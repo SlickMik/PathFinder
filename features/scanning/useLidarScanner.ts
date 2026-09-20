@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import { INITIAL_ALERT_STATE, reduceAlertState } from './alertPolicy';
 import { companionSay, resetCompanion } from '../speech/companion';
+import { omniAskFromUri, playOmniAudio, stopOmniAudio } from '../speech/omniLive';
 import { describeCurrentScene, fetchSceneHazards } from '../speech/sceneDescriber';
 import type { SceneHazard } from '../speech/sceneDescriber';
 import { speak, speakStream, stopSpeaking } from '../speech/speech';
@@ -248,6 +249,7 @@ export function useLidarScanner() {
     setLiveDebugError(null);
     setStatus((current) => (current === 'unsupported' ? current : 'ready'));
     deactivateKeepAwake(KEEP_AWAKE_TAG);
+    stopOmniAudio();
     void stopSpeaking();
     if (announceStop) {
       void speak('Obstacle alerts stopped.');
@@ -336,6 +338,7 @@ export function useLidarScanner() {
   useEffect(
     () => () => {
       void ExpoLidarVision.stop();
+      stopOmniAudio();
       void stopSpeaking();
       deactivateKeepAwake(KEEP_AWAKE_TAG);
     },
@@ -418,15 +421,45 @@ export function useLidarScanner() {
     }
   }, [active, announce]);
   const askCompanion = useCallback(
-    async (text: string) => {
+    async (text: string, audioUri: string | null = null) => {
       console.log(`[companion] user said: "${text}"`);
       try {
         // The user spoke — cut off any ongoing narration immediately.
+        stopOmniAudio();
         await stopSpeaking();
         const now = Date.now();
         const recentEvents = journeyEventsRef.current
           .filter((entry) => now - entry.at < 90_000)
           .map((entry) => `${Math.round((now - entry.at) / 1000)}s ago: ${entry.event}`);
+
+        // OMNI Live: when the raw audio was persisted and the backend has an
+        // OMNI key, one multimodal call hears the original speech, sees the
+        // camera frame, reads the LiDAR context, and answers in its own voice.
+        // Any failure falls through to the Baseten chain below.
+        if (audioUri) {
+          const omni = await omniAskFromUri(audioUri, {
+            transcript: text,
+            snapshot: snapshotRef.current,
+            alert: alertRef.current,
+            guidance: guidanceRef.current,
+            events: recentEvents,
+            // Walking companion: every voice turn gets fresh eyes while scanning.
+            withFrame: active,
+          });
+          if (omni) {
+            console.log(`[omni] reply: "${omni.reply}"`);
+            if (omni.audioUrl) {
+              // OMNI's own voice — stopped within 250ms if a critical local
+              // obstacle alert fires mid-reply.
+              await playOmniAudio(omni.audioUrl, () => alertRef.current.risk !== 'critical');
+            } else {
+              const speech = speakStream(() => alertRef.current.risk !== 'critical');
+              speech.push(omni.reply);
+              await speech.done();
+            }
+            return;
+          }
+        }
         // Stream the reply into incremental TTS: the first sentence starts
         // speaking ~1s after the user stops talking, while the model is still
         // generating the rest. The guard yields to a critical local obstacle

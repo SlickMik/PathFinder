@@ -63,6 +63,42 @@ MIT license are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 For a shared device build, configure Apple signing and run `eas build --profile development
 --platform ios`.
 
+## OMNI Live voice companion (Huawei OMNI Live track)
+
+Deterministic LiDAR collision alerts run entirely on-device and never wait on the network. On top
+of them, the zero-dependency Node proxy in `server/index.mjs` (Node 18+) powers the spoken AI
+features. With an OMNI key configured, a companion voice turn becomes **one real-time multimodal
+call** to a Qwen Omni model (via the yibuapi OpenAI-compatible gateway):
+
+- **Speech/audio in** — the recognizer persists the user's raw speech locally; OMNI listens to the
+  original audio instead of trusting on-device STT in noise, wind, or accents
+- **Vision in** — a single deliberately captured camera frame accompanies the turn while scanning
+- **Language in** — compact LiDAR sector distances, corridor risk, route guidance, and recent
+  journey moments ground the reply; the safety persona forbids "safe to cross" claims
+- **Speech out** — OMNI answers in its own natural voice (streamed server-side, played on-device),
+  with the transcript kept in the shared conversation history
+
+One round trip replaces the three-step STT → reply-model → TTS chain. If OMNI's spoken reply is
+interrupted by a critical local obstacle alert, playback stops within 250 ms — local safety always
+wins. Without an OMNI key (or on any failure), the app silently falls back to the existing
+Baseten companion with on-device speech, so the experience degrades gracefully.
+
+```sh
+cp server/.env.example server/.env   # set BASETEN_API_KEY, and OMNI_API_KEY for OMNI Live
+node server/index.mjs                # listens on :8787
+node server/e2e-test.mjs             # end-to-end checks (OMNI checks run when configured)
+```
+
+Point the app at the proxy (device and Mac on the same network):
+
+```sh
+EXPO_PUBLIC_SCENE_DESCRIBE_URL=http://<your-mac-ip>:8787/describe-scene npx expo run:ios --device
+```
+
+Upstream 429/5xx and connection failures are retried with exponential backoff and jitter. The
+OMNI API key stays on the server; the app never talks to the model gateway directly, and reply
+audio is held only in server memory for two minutes.
+
 ## Checks
 
 ```sh
