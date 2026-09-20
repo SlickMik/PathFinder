@@ -26,6 +26,96 @@ export function resetCompanion(): void {
   history.length = 0;
 }
 
+const UNDERSTAND_URL = COMPANION_URL?.replace('/companion', '/understand');
+
+let understandAvailable: boolean | null = null;
+async function canUnderstandAudio(): Promise<boolean> {
+  if (understandAvailable !== null) return understandAvailable;
+  try {
+    const base = COMPANION_URL?.replace('/companion', '');
+    if (!base) return (understandAvailable = false);
+    const response = await fetch(`${base}/health`);
+    const { understand } = (await response.json()) as { understand?: boolean };
+    understandAvailable = Boolean(understand);
+  } catch {
+    understandAvailable = false;
+  }
+  console.log(`[companion] GPT audio understanding available: ${understandAvailable}`);
+  return understandAvailable;
+}
+
+// GPT ears: send the user's RAW audio (plus a camera frame and LiDAR context)
+// to the backend. OpenAI transcribes it — far better than on-device STT with
+// noise, wind, and accents — then the Baseten brain composes the reply.
+// Returns null when unconfigured/failed so callers fall back to the
+// on-device transcript path.
+export async function understandAudio(
+  audioBase64: string,
+  audioMime: string,
+  options: CompanionOptions = {},
+): Promise<{ transcript: string; reply: string } | null> {
+  if (!UNDERSTAND_URL || !(await canUnderstandAudio())) return null;
+  const { snapshot = null, alert = null, guidance = null, events = [], withFrame = false } = options;
+  try {
+    const frame = withFrame ? await ExpoLidarVision.captureFrame(512, 0.5) : null;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20_000);
+    try {
+      const response = await fetch(UNDERSTAND_URL, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(APP_SECRET ? { 'x-app-secret': APP_SECRET } : {}),
+        },
+        body: JSON.stringify({
+          audioBase64,
+          audioMime,
+          history,
+          events: events.slice(-6),
+          lidar: buildLidarPayload(snapshot, alert, guidance),
+          ...(frame ? { imageBase64: frame.base64, mimeType: 'image/jpeg' } : {}),
+        }),
+      });
+      if (!response.ok) throw new Error(`Understand failed (${response.status}).`);
+      const { transcript, reply } = (await response.json()) as {
+        transcript?: string;
+        reply?: string;
+      };
+      if (!transcript || !reply) throw new Error('Incomplete understand response.');
+      history.push({ role: 'user', content: transcript }, { role: 'assistant', content: reply });
+      while (history.length > MAX_TURNS) history.splice(0, 2);
+      return { transcript, reply };
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (error) {
+    console.warn('[companion] understandAudio failed, falling back:', error);
+    return null;
+  }
+}
+
+function buildLidarPayload(
+  snapshot: ObstacleSnapshot | null,
+  alert: AlertState | null,
+  guidance: NavigationGuidance | null,
+) {
+  return {
+    ...(compactLidarContext(snapshot) ?? {}),
+    alert: alert ? { risk: alert.risk, direction: alert.direction } : null,
+    guidance:
+      guidance && guidance.instruction !== 'hold'
+        ? {
+            instruction: guidance.instruction,
+            clearanceM: guidance.clearanceM,
+            openingWidthM: guidance.openingWidthM,
+            confidence: guidance.confidence,
+            source: guidance.source,
+          }
+        : null,
+  };
+}
+
 type CompanionOptions = {
   snapshot?: ObstacleSnapshot | null;
   alert?: AlertState | null;
@@ -67,20 +157,7 @@ async function requestReply(
     'Content-Type': 'application/json',
     ...(APP_SECRET ? { 'x-app-secret': APP_SECRET } : {}),
   };
-  const lidar = {
-    ...(compactLidarContext(snapshot) ?? {}),
-    alert: alert ? { risk: alert.risk, direction: alert.direction } : null,
-    guidance:
-      guidance && guidance.instruction !== 'hold'
-        ? {
-            instruction: guidance.instruction,
-            clearanceM: guidance.clearanceM,
-            openingWidthM: guidance.openingWidthM,
-            confidence: guidance.confidence,
-            source: guidance.source,
-          }
-        : null,
-  };
+  const lidar = buildLidarPayload(snapshot, alert, guidance);
   const body = {
     text,
     history,

@@ -43,9 +43,9 @@ export default function ScannerScreen() {
   }, []);
 
   const voice = useVoiceInput(
-    (text) => {
+    (text, audioUri) => {
       void (async () => {
-        await scanner.askCompanion(text); // resolves after the reply is spoken
+        await scanner.askCompanion(text, audioUri ?? null); // resolves after the reply is spoken
         resumeListening(350);
       })();
     },

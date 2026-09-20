@@ -39,8 +39,19 @@ const COMPANION_MODEL = process.env.BASETEN_COMPANION_MODEL ?? 'moonshotai/Kimi-
 // Fastest vision-capable GPU model on Baseten — used for any turn that
 // carries a camera frame so replies come back quicker.
 const FAST_VISION_MODEL = process.env.BASETEN_FAST_VISION_MODEL ?? 'zai-org/GLM-5.3-Flash';
+// Optional integrations — the app degrades gracefully when these are absent.
+// ElevenLabs: natural voice out. OpenAI: understands the user's raw audio
+// (better than on-device STT in noise/accents); the reply brain stays Baseten.
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || null;
+// Sarah is a current premade voice available to free-tier API accounts; the
+// former Rachel library voice now returns `paid_plan_required` for those keys.
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? 'EXAVITQu4vr4xnSDxMaL';
+const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_turbo_v2_5';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
+const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe';
 const SHARED_SECRET = process.env.APP_SHARED_SECRET || null;
-const BASETEN_URL = 'https://inference.baseten.co/v1/chat/completions';
+// Overridable for local testing against a mock upstream.
+const BASETEN_URL = process.env.BASETEN_URL ?? 'https://inference.baseten.co/v1/chat/completions';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // one compressed 768px JPEG fits easily
 const UPSTREAM_TIMEOUT_MS = 25_000;
@@ -75,6 +86,7 @@ Style:
 - Direction suggestions may come from an on-device walkable-path segmentation model or the LiDAR route planner — you can mention where a suggestion comes from casually ("the path model likes the left side").
 - You always receive live LiDAR context. When asked what's ahead, around, or how far something is — answer directly from the LiDAR sector distances, corridor reading, and alert state, even with no image. Convert meters to natural speech ("about a meter and a half ahead on your left").
 - If LiDAR shows a sector as unknown, say you can't read that side rather than guessing.
+- If NO LiDAR context is provided at all, obstacle scanning is off — answer conversationally but remind them once: "start obstacle alerts and I'll be able to see distances". Never pretend to have sensor readings you weren't given.
 - Use approximate distances only when the provided LiDAR context supports them.
 
 Hard safety rules (never break these, even if asked):
@@ -199,7 +211,7 @@ function companionRequestBody({ text, history, events, imageBase64, mimeType, li
     // more conversational model.
     model: imageBase64 ? FAST_VISION_MODEL : COMPANION_MODEL,
     temperature: 0.7,
-    max_tokens: 90,
+    max_tokens: 140,
     messages: [
       { role: 'system', content: COMPANION_PROMPT },
       ...sanitizeHistory(history),
@@ -232,33 +244,88 @@ function describeRequestBody({ imageBase64, mimeType, lidar }) {
   };
 }
 
+// Retry policy per Baseten's hackathon guidance: back off exponentially (with
+// jitter) on 429 rate limits and transient 5xx/network failures, honouring a
+// Retry-After header when present, and never retrying in a tight loop.
+// Streams are only retried before the first token has been forwarded to the
+// client (a replay after that would duplicate speech). Timeouts are never
+// retried — the pedestrian is waiting.
+const MAX_UPSTREAM_RETRIES = Math.max(0, Number(process.env.BASETEN_MAX_RETRIES ?? 2));
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function retryDelayMs(attempt, retryAfterS) {
+  if (Number.isFinite(retryAfterS) && retryAfterS > 0) return Math.min(retryAfterS * 1000, 10_000);
+  const base = Math.min(500 * 2 ** attempt, 4_000); // 500ms, 1s, 2s, capped at 4s
+  return Math.round(base * (0.5 + Math.random() * 0.5)); // jitter so clients don't sync up
+}
+
+async function callBaseten(body, onDelta) {
+  const streaming = typeof onDelta === 'function';
+  let tokensSent = false;
+  const guardedDelta = streaming
+    ? (delta) => {
+        tokensSent = true;
+        onDelta(delta);
+      }
+    : null;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await callBasetenOnce(body, guardedDelta);
+    } catch (error) {
+      const transient =
+        error.upstreamStatus === 429 ||
+        (error.upstreamStatus >= 500 && error.upstreamStatus <= 599) ||
+        error.networkFailure === true;
+      if (!transient || tokensSent || attempt >= MAX_UPSTREAM_RETRIES) throw error;
+      const delay = retryDelayMs(attempt, error.retryAfterS);
+      console.warn(
+        `[baseten] ${error.upstreamStatus ?? 'network error'} — retry ${attempt + 1}/${MAX_UPSTREAM_RETRIES} in ${delay}ms`,
+      );
+      await sleep(delay);
+    }
+  }
+}
+
 // One Baseten call. When onDelta is given, streams SSE token deltas to it as
 // they arrive (Baseten supports `stream: true` on /v1/chat/completions); the
 // returned `content` is the full concatenated reply either way. onDelta lets
 // the proxy forward tokens to the client the moment they're generated, so the
 // pedestrian hears the first sentence ~1s in instead of waiting for the whole
 // reply.
-async function callBaseten(body, onDelta) {
+async function callBasetenOnce(body, onDelta) {
   const streaming = typeof onDelta === 'function';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   const upstreamStart = Date.now();
   try {
-    const response = await fetch(BASETEN_URL, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${BASETEN_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ ...body, stream: streaming }),
-    });
+    let response;
+    try {
+      response = await fetch(BASETEN_URL, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${BASETEN_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ...body, stream: streaming }),
+      });
+    } catch (error) {
+      // Connection-level failure (DNS, reset, TLS) — retriable. Timeouts
+      // (AbortError) are not: the client has already waited long enough.
+      if (error?.name !== 'AbortError') error.networkFailure = true;
+      throw error;
+    }
 
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
       throw Object.assign(
         new Error(`Baseten error ${response.status}: ${detail.slice(0, 300)}`),
-        { status: 502 },
+        {
+          status: response.status === 429 ? 429 : 502,
+          upstreamStatus: response.status,
+          retryAfterS: Number(response.headers.get('retry-after')),
+        },
       );
     }
 
@@ -364,6 +431,58 @@ function hazardsRequestBody({ imageBase64, mimeType, lidar }) {
   };
 }
 
+// --- ElevenLabs TTS: stream mp3 for one sentence/utterance ------------------
+async function streamTts(res, text) {
+  const upstream = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=mp3_44100_64`,
+    {
+      method: 'POST',
+      headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text,
+        model_id: ELEVENLABS_MODEL,
+        voice_settings: { stability: 0.45, similarity_boost: 0.7 },
+      }),
+    },
+  );
+  if (!upstream.ok) {
+    const detail = await upstream.text().catch(() => '');
+    throw Object.assign(new Error(`ElevenLabs ${upstream.status}: ${detail.slice(0, 200)}`), {
+      status: 502,
+    });
+  }
+  res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' });
+  for await (const chunk of upstream.body) res.write(chunk);
+  res.end();
+}
+
+// --- OpenAI ears: transcribe the user's raw audio ---------------------------
+async function transcribeAudio(audioBase64, audioMime) {
+  const form = new FormData();
+  const ext = audioMime.includes('wav') ? 'wav' : audioMime.includes('caf') ? 'caf' : 'm4a';
+  form.append(
+    'file',
+    new Blob([Buffer.from(audioBase64, 'base64')], { type: audioMime }),
+    `speech.${ext}`,
+  );
+  form.append('model', OPENAI_TRANSCRIBE_MODEL);
+  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: form,
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw Object.assign(new Error(`OpenAI ${response.status}: ${detail.slice(0, 200)}`), {
+      status: 502,
+    });
+  }
+  const data = await response.json();
+  const transcript = (data.text ?? '').trim();
+  if (!transcript) throw Object.assign(new Error('Empty transcript.'), { status: 422 });
+  return transcript;
+}
+
 async function extractHazards(opts) {
   const { content, usage, upstreamMs } = await callBaseten(hazardsRequestBody(opts), null);
   let hazards = [];
@@ -393,14 +512,29 @@ async function streamReply(res, requestBody, started, label) {
     Connection: 'keep-alive',
   });
   try {
-    const { usage, upstreamMs } = await callBaseten(requestBody, (delta) => {
-      res.write(`data: ${JSON.stringify({ delta })}\n\n`);
-    });
+    let usage;
+    let upstreamMs;
+    let retried = false;
+    try {
+      ({ usage, upstreamMs } = await callBaseten(requestBody, (delta) => {
+        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+      }));
+    } catch (error) {
+      // Streamed generations occasionally yield zero content tokens (e.g. the
+      // model spends its budget on reasoning). Never leave the user in
+      // silence: retry once buffered and emit the reply as a single delta.
+      if (!/Empty model response/.test(error.message)) throw error;
+      console.warn(`[${label}] empty stream — retrying buffered`);
+      retried = true;
+      const retry = await callBaseten({ ...requestBody, max_tokens: 220 }, null);
+      res.write(`data: ${JSON.stringify({ delta: retry.content })}\n\n`);
+      ({ usage, upstreamMs } = retry);
+    }
     res.write('data: [DONE]\n\n');
     res.end();
     const totalMs = Date.now() - started;
     console.log(
-      `[${label}] stream ok total=${totalMs}ms upstream=${upstreamMs}ms overhead=${totalMs - upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+      `[${label}] stream ok${retried ? ' (retried)' : ''} total=${totalMs}ms upstream=${upstreamMs}ms overhead=${totalMs - upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
     );
   } catch (error) {
     // Match the non-streaming path: send a generic message to the client and
@@ -417,9 +551,38 @@ const server = http.createServer(async (req, res) => {
   const ip = req.socket.remoteAddress ?? 'unknown';
 
   if (req.method === 'GET' && req.url === '/health') {
-    return send(res, 200, { ok: true, model: MODEL, companionModel: COMPANION_MODEL });
+    return send(res, 200, {
+      ok: true,
+      model: MODEL,
+      companionModel: COMPANION_MODEL,
+      tts: Boolean(ELEVENLABS_API_KEY),
+      understand: Boolean(OPENAI_API_KEY),
+    });
   }
-  if (req.method !== 'POST' || !['/describe-scene', '/companion', '/hazards'].includes(req.url)) {
+  if (req.method === 'GET' && req.url?.startsWith('/tts?')) {
+    if (!ELEVENLABS_API_KEY) return send(res, 503, { error: 'TTS not configured.' });
+    if (rateLimited(ip)) return send(res, 429, { error: 'Too many requests.' });
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const text = (params.get('text') ?? '').slice(0, 600).trim();
+    if (SHARED_SECRET && params.get('secret') !== SHARED_SECRET) {
+      return send(res, 401, { error: 'Unauthorized.' });
+    }
+    if (!text) return send(res, 400, { error: 'text is required.' });
+    try {
+      const ttsStarted = Date.now();
+      await streamTts(res, text);
+      console.log(`[tts] ok ${Date.now() - ttsStarted}ms chars=${text.length}`);
+    } catch (error) {
+      console.error(`[tts] fail: ${error.message}`);
+      if (!res.headersSent) send(res, error.status ?? 500, { error: 'TTS failed.' });
+      else res.end();
+    }
+    return;
+  }
+  if (
+    req.method !== 'POST' ||
+    !['/describe-scene', '/companion', '/hazards', '/understand'].includes(req.url)
+  ) {
     return send(res, 404, { error: 'Not found.' });
   }
   if (SHARED_SECRET && req.headers['x-app-secret'] !== SHARED_SECRET) {
@@ -434,6 +597,29 @@ const server = http.createServer(async (req, res) => {
     const { imageBase64, mimeType = 'image/jpeg', lidar } = body ?? {};
     if (imageBase64 !== undefined && !['image/jpeg', 'image/png'].includes(mimeType)) {
       return send(res, 400, { error: 'Unsupported mimeType.' });
+    }
+
+    if (req.url === '/understand') {
+      if (!OPENAI_API_KEY) return send(res, 503, { error: 'Understand not configured.' });
+      const { audioBase64, audioMime = 'audio/m4a', history, events } = body ?? {};
+      if (typeof audioBase64 !== 'string' || audioBase64.length < 100) {
+        return send(res, 400, { error: 'audioBase64 is required.' });
+      }
+      const transcript = await transcribeAudio(audioBase64, audioMime);
+      console.log(`[understand] transcript (${transcript.length} chars) via ${OPENAI_TRANSCRIBE_MODEL}`);
+      const { reply, usage, upstreamMs } = await companionChat({
+        text: transcript.slice(0, 1000),
+        history,
+        events,
+        imageBase64: typeof imageBase64 === 'string' ? imageBase64 : null,
+        mimeType,
+        lidar,
+      });
+      const totalMs = Date.now() - started;
+      console.log(
+        `[understand] ok total=${totalMs}ms brain=${upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+      );
+      return send(res, 200, { transcript, reply });
     }
 
     if (req.url === '/companion') {

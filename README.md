@@ -63,6 +63,43 @@ MIT license are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 For a shared device build, configure Apple signing and run `eas build --profile development
 --platform ios`.
 
+## AI companion backend (Baseten)
+
+Deterministic LiDAR collision alerts run entirely on-device and never wait on the network. On
+top of them, an optional zero-dependency Node proxy (`server/index.mjs`, Node 18+) powers the
+spoken AI features through [Baseten Model APIs](https://docs.baseten.co/inference/model-apis/overview):
+
+- `POST /describe-scene` — on-request scene descriptions from a vision model
+  (`zai-org/GLM-5.3-Flash` by default), grounded in compact LiDAR context
+- `POST /hazards` — structured hazard extraction with a strict JSON schema
+- `POST /companion` — the "Path" walking companion, token-streamed over SSE so speech starts
+  before the model finishes generating
+- `POST /understand` — raw-audio understanding (OpenAI transcription; the reply brain stays
+  Baseten) — optional
+- `GET /tts` — ElevenLabs natural voice — optional
+
+The Baseten API key lives only on the server. The app sends a single deliberately captured
+frame plus compact LiDAR sector distances — never a continuous video feed or the raw depth map.
+Upstream 429/5xx and connection failures are retried with exponential backoff and jitter
+(honouring `Retry-After`); streamed replies are only retried before the first token reaches the
+client.
+
+```sh
+cp server/.env.example server/.env   # set BASETEN_API_KEY
+node server/index.mjs                # listens on :8787
+node server/e2e-test.mjs             # optional end-to-end check
+```
+
+Point the app at the proxy (device and Mac on the same network):
+
+```sh
+EXPO_PUBLIC_SCENE_DESCRIBE_URL=http://<your-mac-ip>:8787/describe-scene npx expo run:ios --device
+```
+
+`EXPO_PUBLIC_COMPANION_URL` and `EXPO_PUBLIC_SCENE_APP_SECRET` are optional overrides; the
+companion, hazard, and understand URLs are otherwise derived from the scene URL. Without a
+backend the app degrades gracefully to on-device speech, alerts, and guidance.
+
 ## Checks
 
 ```sh
