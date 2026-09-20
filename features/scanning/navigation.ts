@@ -8,6 +8,7 @@ import type {
   ObstacleSnapshot,
   SafetyEnvelope,
   SectorReading,
+  WalkableSurface,
 } from './types';
 
 const PHRASES: Record<NavigationInstruction, string | null> = {
@@ -27,6 +28,7 @@ export const INITIAL_NAVIGATION_GUIDANCE: NavigationGuidance = {
   clearanceM: null,
   openingWidthM: null,
   isNarrowOpening: false,
+  surfaceClass: null,
   source: 'none',
   pendingInstruction: null,
   pendingFrameCount: 0,
@@ -75,6 +77,7 @@ export function planNavigation(
         : planned.phrase,
       openingWidthM: route.openingWidthM,
       isNarrowOpening: route.isNarrowOpening,
+      surfaceClass: route.surfaceClass ?? null,
       source: route.source ?? 'lidar-route',
     };
   }
@@ -176,10 +179,29 @@ function guidance(
     clearanceM,
     openingWidthM: null,
     isNarrowOpening: false,
+    surfaceClass: null,
     source: 'reactive-sectors',
     pendingInstruction: null,
     pendingFrameCount: 0,
   };
+}
+
+export function surfacePhrase(surface: WalkableSurface | null): string | null {
+  switch (surface) {
+    case 'doorway-opening':
+      return 'Doorway ahead.';
+    case 'curb-cut':
+      return 'Curb cut ahead.';
+    case 'plain-crosswalk':
+    case 'zebra-crosswalk':
+      return 'Crosswalk ahead.';
+    case 'sidewalk':
+      return 'Sidewalk ahead.';
+    case 'covering':
+      return 'Walkable floor ahead.';
+    default:
+      return null;
+  }
 }
 
 function narrowOpeningPhrase(instruction: NavigationInstruction): string {
