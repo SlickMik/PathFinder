@@ -84,6 +84,7 @@ Style:
 - Direction suggestions may come from an on-device walkable-path segmentation model or the LiDAR route planner — you can mention where a suggestion comes from casually ("the path model likes the left side").
 - You always receive live LiDAR context. When asked what's ahead, around, or how far something is — answer directly from the LiDAR sector distances, corridor reading, and alert state, even with no image. Convert meters to natural speech ("about a meter and a half ahead on your left").
 - If LiDAR shows a sector as unknown, say you can't read that side rather than guessing.
+- If NO LiDAR context is provided at all, obstacle scanning is off — answer conversationally but remind them once: "start obstacle alerts and I'll be able to see distances". Never pretend to have sensor readings you weren't given.
 - Use approximate distances only when the provided LiDAR context supports them.
 
 Hard safety rules (never break these, even if asked):
@@ -208,7 +209,7 @@ function companionRequestBody({ text, history, events, imageBase64, mimeType, li
     // more conversational model.
     model: imageBase64 ? FAST_VISION_MODEL : COMPANION_MODEL,
     temperature: 0.7,
-    max_tokens: 90,
+    max_tokens: 140,
     messages: [
       { role: 'system', content: COMPANION_PROMPT },
       ...sanitizeHistory(history),
@@ -509,14 +510,29 @@ async function streamReply(res, requestBody, started, label) {
     Connection: 'keep-alive',
   });
   try {
-    const { usage, upstreamMs } = await callBaseten(requestBody, (delta) => {
-      res.write(`data: ${JSON.stringify({ delta })}\n\n`);
-    });
+    let usage;
+    let upstreamMs;
+    let retried = false;
+    try {
+      ({ usage, upstreamMs } = await callBaseten(requestBody, (delta) => {
+        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+      }));
+    } catch (error) {
+      // Streamed generations occasionally yield zero content tokens (e.g. the
+      // model spends its budget on reasoning). Never leave the user in
+      // silence: retry once buffered and emit the reply as a single delta.
+      if (!/Empty model response/.test(error.message)) throw error;
+      console.warn(`[${label}] empty stream — retrying buffered`);
+      retried = true;
+      const retry = await callBaseten({ ...requestBody, max_tokens: 220 }, null);
+      res.write(`data: ${JSON.stringify({ delta: retry.content })}\n\n`);
+      ({ usage, upstreamMs } = retry);
+    }
     res.write('data: [DONE]\n\n');
     res.end();
     const totalMs = Date.now() - started;
     console.log(
-      `[${label}] stream ok total=${totalMs}ms upstream=${upstreamMs}ms overhead=${totalMs - upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
+      `[${label}] stream ok${retried ? ' (retried)' : ''} total=${totalMs}ms upstream=${upstreamMs}ms overhead=${totalMs - upstreamMs}ms tokens=${usage?.prompt_tokens ?? '?'}/${usage?.completion_tokens ?? '?'}`,
     );
   } catch (error) {
     // Match the non-streaming path: send a generic message to the client and
